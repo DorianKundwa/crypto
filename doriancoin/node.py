@@ -43,7 +43,7 @@ import os
 import sys
 import threading
 import requests
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_file, make_response
 
 from blockchain import Blockchain, Block
 from wallet import Wallet
@@ -55,6 +55,15 @@ from storage import BlockchainStorage
 
 app = Flask(__name__)
 app.config["JSON_SORT_KEYS"] = False   # preserve insertion order in responses
+
+
+@app.after_request
+def _add_cors(response):
+    """Allow the Block Explorer (any origin) to call our API."""
+    response.headers["Access-Control-Allow-Origin"]  = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return response
 
 # ---------------------------------------------------------------------------
 # Global state  (populated in __main__ before app.run())
@@ -326,6 +335,22 @@ def get_history(address: str):
     return jsonify({"address": address, "count": len(history), "transactions": history})
 
 
+
+# ---------------------------------------------------------------------------
+# Routes — Block Explorer (Stage 6)
+# ---------------------------------------------------------------------------
+
+@app.route("/explorer", methods=["GET"])
+def explorer():
+    """Serve the DorianCoin Block Explorer web UI.
+
+    The HTML file lives next to node.py so relative API calls (e.g. /chain)
+    hit the same origin -- no proxy or CORS workarounds needed.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    return send_file(os.path.join(here, "explorer.html"))
+
+
 @app.route("/wallet/new", methods=["GET"])
 def new_wallet():
     """Generate a fresh ECDSA wallet.
@@ -492,6 +517,7 @@ if __name__ == "__main__":
     print("=" * 58)
     print()
     print("  Endpoints:")
+    print(f"    GET  http://localhost:{args.port}/explorer   <-- Block Explorer UI")
     print(f"    GET  http://localhost:{args.port}/")
     print(f"    GET  http://localhost:{args.port}/chain")
     print(f"    GET  http://localhost:{args.port}/mine")

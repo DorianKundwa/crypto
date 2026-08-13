@@ -1,0 +1,868 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DorianCoin Explorer</title>
+<meta name="description" content="DorianCoin (DRN) Block Explorer — live blockchain data, address balances, transaction history.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+/* ─── Reset & Base ────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg:        #080b12;
+  --bg2:       #0d1117;
+  --bg3:       #131923;
+  --surface:   rgba(255,255,255,0.04);
+  --surface2:  rgba(255,255,255,0.07);
+  --border:    rgba(255,255,255,0.08);
+  --border2:   rgba(255,255,255,0.14);
+  --cyan:      #00d4ff;
+  --cyan-dim:  rgba(0,212,255,0.15);
+  --cyan-glow: rgba(0,212,255,0.35);
+  --purple:    #7c3aed;
+  --purple-dim:rgba(124,58,237,0.15);
+  --green:     #10b981;
+  --green-dim: rgba(16,185,129,0.15);
+  --orange:    #f59e0b;
+  --red:       #ef4444;
+  --text:      #e8edf5;
+  --text2:     #8b95a8;
+  --text3:     #5a6478;
+  --mono:      'JetBrains Mono', monospace;
+  --sans:      'Inter', system-ui, sans-serif;
+  --radius:    10px;
+  --radius-lg: 16px;
+  --shadow:    0 8px 32px rgba(0,0,0,0.5);
+  --transition:0.2s ease;
+}
+html { font-size: 15px; scroll-behavior: smooth; }
+body {
+  font-family: var(--sans);
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+/* ─── Scrollbar ───────────────────────────────────────────── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 9999px; }
+
+/* ─── Utility ─────────────────────────────────────────────── */
+.mono    { font-family: var(--mono); font-size: 0.82rem; }
+.dim     { color: var(--text2); }
+.dimmer  { color: var(--text3); }
+.cyan    { color: var(--cyan); }
+.green   { color: var(--green); }
+.orange  { color: var(--orange); }
+.red     { color: var(--red); }
+.truncate{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.flex    { display: flex; }
+.items-center { align-items: center; }
+.gap-1   { gap: 0.35rem; }
+.gap-2   { gap: 0.75rem; }
+.pointer { cursor: pointer; }
+
+/* ─── Animations ──────────────────────────────────────────── */
+@keyframes pulse   { 0%,100%{opacity:1} 50%{opacity:0.4} }
+@keyframes spin    { to{transform:rotate(360deg)} }
+@keyframes fadeIn  { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
+@keyframes slideIn { from{opacity:0;transform:translateX(40px)} to{opacity:1;transform:translateX(0)} }
+@keyframes glow    { 0%,100%{box-shadow:0 0 12px var(--cyan-glow)} 50%{box-shadow:0 0 28px var(--cyan-glow),0 0 60px var(--cyan-dim)} }
+@keyframes scanline{ 0%{top:-100%} 100%{top:100%} }
+@keyframes newBlock{ 0%{background:var(--cyan-dim);border-color:var(--cyan)} 100%{background:var(--surface);border-color:var(--border)} }
+
+/* ─── Topbar ──────────────────────────────────────────────── */
+#topbar {
+  position: sticky; top: 0; z-index: 100;
+  display: flex; align-items: center; gap: 1rem;
+  padding: 0.75rem 1.5rem;
+  background: rgba(8,11,18,0.85);
+  backdrop-filter: blur(16px);
+  border-bottom: 1px solid var(--border);
+}
+.logo {
+  display: flex; align-items: center; gap: 0.6rem;
+  font-size: 1.15rem; font-weight: 800; letter-spacing: -0.02em;
+  text-decoration: none; color: inherit;
+}
+.logo-icon {
+  width: 32px; height: 32px;
+  background: linear-gradient(135deg, var(--cyan), var(--purple));
+  border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 1rem; font-weight: 900;
+  color: #fff; flex-shrink: 0;
+}
+.logo span.drn { color: var(--cyan); }
+
+#status-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--text3); flex-shrink: 0;
+  transition: background var(--transition);
+}
+#status-dot.online  { background: var(--green); animation: pulse 2s infinite; }
+#status-dot.loading { background: var(--orange); animation: pulse 0.8s infinite; }
+#status-dot.offline { background: var(--red); }
+
+#status-label { font-size: 0.78rem; color: var(--text2); }
+#node-id      { font-family: var(--mono); font-size: 0.72rem; color: var(--text3); }
+
+.topbar-right {
+  margin-left: auto; display: flex; align-items: center; gap: 0.75rem;
+}
+#refresh-time { font-size: 0.72rem; color: var(--text3); }
+
+/* ─── Search Bar ──────────────────────────────────────────── */
+#search-wrap {
+  flex: 1; max-width: 380px;
+  position: relative;
+}
+#search-input {
+  width: 100%;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.45rem 2.5rem 0.45rem 0.85rem;
+  font-family: var(--mono); font-size: 0.78rem;
+  color: var(--text);
+  outline: none;
+  transition: border-color var(--transition), background var(--transition);
+}
+#search-input::placeholder { color: var(--text3); }
+#search-input:focus { border-color: var(--cyan); background: var(--surface2); }
+#search-btn {
+  position: absolute; right: 0.5rem; top: 50%; transform: translateY(-50%);
+  background: none; border: none; color: var(--text2); cursor: pointer;
+  font-size: 1rem; padding: 0; line-height: 1;
+  transition: color var(--transition);
+}
+#search-btn:hover { color: var(--cyan); }
+
+/* ─── Mine Button ─────────────────────────────────────────── */
+#mine-btn {
+  padding: 0.45rem 1.1rem;
+  background: linear-gradient(135deg, var(--cyan), #0099cc);
+  border: none; border-radius: var(--radius);
+  font-family: var(--sans); font-size: 0.82rem; font-weight: 600;
+  color: #050a10; cursor: pointer;
+  transition: opacity var(--transition), transform var(--transition);
+  white-space: nowrap;
+}
+#mine-btn:hover  { opacity: 0.9; transform: translateY(-1px); }
+#mine-btn:active { transform: translateY(0); }
+#mine-btn.mining {
+  background: var(--surface2); color: var(--text2);
+  animation: pulse 0.8s infinite;
+  pointer-events: none;
+}
+
+/* ─── Stats Bar ───────────────────────────────────────────── */
+#stats-bar {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 0.75rem;
+  padding: 1rem 1.5rem;
+  border-bottom: 1px solid var(--border);
+}
+.stat-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.75rem 1rem;
+  transition: border-color var(--transition);
+}
+.stat-card:hover { border-color: var(--border2); }
+.stat-label { font-size: 0.68rem; color: var(--text3); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.3rem; }
+.stat-value { font-size: 1.3rem; font-weight: 700; line-height: 1; }
+.stat-sub   { font-size: 0.68rem; color: var(--text2); margin-top: 0.2rem; }
+
+/* ─── Main Layout ─────────────────────────────────────────── */
+#main {
+  display: grid;
+  grid-template-columns: 1fr 340px;
+  gap: 1rem;
+  padding: 1rem 1.5rem 2rem;
+  min-height: calc(100vh - 200px);
+}
+
+/* ─── Panel Chrome ────────────────────────────────────────── */
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+.panel-hdr {
+  display: flex; align-items: center; gap: 0.6rem;
+  padding: 0.9rem 1.1rem;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.82rem; font-weight: 600;
+}
+.panel-hdr .badge {
+  margin-left: auto;
+  background: var(--cyan-dim); color: var(--cyan);
+  font-size: 0.68rem; padding: 0.15rem 0.5rem;
+  border-radius: 9999px;
+}
+
+/* ─── Block List ──────────────────────────────────────────── */
+#blocks-list { padding: 0.5rem; overflow-y: auto; max-height: 75vh; }
+.block-row {
+  display: grid;
+  grid-template-columns: 60px 1fr 80px 70px 90px;
+  align-items: center; gap: 0.75rem;
+  padding: 0.75rem 0.85rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-bottom: 0.4rem;
+  cursor: pointer;
+  background: transparent;
+  transition: background var(--transition), border-color var(--transition);
+  animation: fadeIn 0.3s ease;
+}
+.block-row:hover { background: var(--surface2); border-color: var(--border2); }
+.block-row.genesis { border-color: rgba(124,58,237,0.3); }
+.block-row.new-block { animation: newBlock 1.5s ease forwards; }
+
+.block-num {
+  font-size: 1.1rem; font-weight: 700; color: var(--cyan);
+  font-family: var(--mono);
+}
+.block-hash-wrap .label { font-size: 0.68rem; color: var(--text3); margin-bottom: 0.1rem; }
+.block-hash {
+  font-family: var(--mono); font-size: 0.77rem; color: var(--text2);
+  max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.block-hash .zeros { color: var(--cyan); }
+.block-txns { text-align: center; }
+.block-txns .num { font-size: 1rem; font-weight: 600; }
+.block-txns .lbl { font-size: 0.65rem; color: var(--text3); }
+.block-time { font-size: 0.75rem; color: var(--text2); text-align: right; }
+.diff-pill {
+  text-align: center;
+  padding: 0.2rem 0.5rem;
+  border-radius: 9999px;
+  font-size: 0.7rem; font-weight: 600;
+  font-family: var(--mono);
+}
+
+/* ─── Sidebar ─────────────────────────────────────────────── */
+#sidebar { display: flex; flex-direction: column; gap: 0.75rem; }
+
+/* ─── Retarget Gauge ──────────────────────────────────────── */
+.progress-track {
+  height: 6px; background: var(--bg3); border-radius: 9999px; overflow: hidden;
+  margin: 0.6rem 0;
+}
+.progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--cyan), var(--purple));
+  border-radius: 9999px;
+  transition: width 0.4s ease;
+}
+.retarget-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; padding: 0.6rem 1.1rem; }
+.retarget-item .lbl { font-size: 0.65rem; color: var(--text3); }
+.retarget-item .val { font-size: 0.9rem; font-weight: 600; font-family: var(--mono); }
+
+/* ─── Mempool ─────────────────────────────────────────────── */
+#mempool-list { padding: 0.5rem 1rem 0.75rem; }
+.mempool-empty { color: var(--text3); font-size: 0.8rem; padding: 0.5rem 0; }
+.mempool-tx {
+  display: flex; align-items: center; gap: 0.5rem;
+  font-size: 0.75rem; padding: 0.4rem 0;
+  border-bottom: 1px solid var(--border);
+}
+.mempool-tx:last-child { border-bottom: none; }
+.mempool-addr { font-family: var(--mono); font-size: 0.7rem; color: var(--text2); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mempool-amount { font-weight: 600; color: var(--cyan); white-space: nowrap; font-family: var(--mono); }
+
+/* ─── Peers ───────────────────────────────────────────────── */
+#peers-list { padding: 0.5rem 1.1rem 0.75rem; }
+.peer-item { font-family: var(--mono); font-size: 0.75rem; color: var(--text2); padding: 0.25rem 0; }
+.no-peers   { color: var(--text3); font-size: 0.8rem; }
+
+/* ─── Block Detail Panel ──────────────────────────────────── */
+#detail-overlay {
+  display: none;
+  position: fixed; inset: 0; z-index: 200;
+  background: rgba(0,0,0,0.6);
+  backdrop-filter: blur(4px);
+}
+#detail-panel {
+  position: fixed; top: 0; right: 0; bottom: 0; z-index: 201;
+  width: min(560px, 96vw);
+  background: var(--bg2);
+  border-left: 1px solid var(--border2);
+  display: flex; flex-direction: column;
+  animation: slideIn 0.25s ease;
+  overflow: hidden;
+}
+#detail-panel.hidden { display: none; }
+#detail-hdr {
+  display: flex; align-items: center; gap: 0.75rem;
+  padding: 1rem 1.25rem;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+#detail-title { font-size: 1rem; font-weight: 700; }
+#detail-close {
+  margin-left: auto; background: none; border: none;
+  color: var(--text2); font-size: 1.4rem; cursor: pointer; line-height: 1;
+  transition: color var(--transition);
+}
+#detail-close:hover { color: var(--text); }
+#detail-body { overflow-y: auto; flex: 1; padding: 1.1rem; }
+
+.detail-row {
+  display: flex; flex-direction: column; gap: 0.2rem;
+  padding: 0.65rem 0;
+  border-bottom: 1px solid var(--border);
+}
+.detail-row:last-child { border-bottom: none; }
+.detail-row .lbl { font-size: 0.68rem; color: var(--text3); text-transform: uppercase; letter-spacing: 0.05em; }
+.detail-row .val { font-family: var(--mono); font-size: 0.8rem; word-break: break-all; }
+.detail-row .val.big { font-size: 1.05rem; font-weight: 700; color: var(--cyan); }
+
+.tx-table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; font-size: 0.75rem; }
+.tx-table th { color: var(--text3); font-weight: 500; text-align: left; padding: 0.3rem 0.4rem; border-bottom: 1px solid var(--border); }
+.tx-table td { padding: 0.4rem 0.4rem; border-bottom: 1px solid var(--border); font-family: var(--mono); }
+.tx-table tr:last-child td { border-bottom: none; }
+.tx-table .coinbase { color: var(--purple); }
+.tx-table .amount   { color: var(--cyan); font-weight: 600; text-align: right; }
+
+/* ─── Address Lookup Result ───────────────────────────────── */
+#addr-result {
+  display: none;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.85rem 1rem;
+  margin-top: 0.75rem;
+}
+#addr-result h4 { font-size: 0.75rem; color: var(--text3); margin-bottom: 0.5rem; }
+#addr-balance-big { font-size: 1.6rem; font-weight: 800; color: var(--cyan); font-family: var(--mono); }
+#addr-history-table { margin-top: 0.75rem; }
+
+/* ─── Toast Notification ──────────────────────────────────── */
+#toast-container {
+  position: fixed; bottom: 1.5rem; right: 1.5rem; z-index: 999;
+  display: flex; flex-direction: column; gap: 0.5rem;
+  pointer-events: none;
+}
+.toast {
+  background: var(--bg3); border: 1px solid var(--border2);
+  border-radius: var(--radius); padding: 0.7rem 1rem;
+  font-size: 0.8rem; max-width: 300px;
+  animation: fadeIn 0.3s ease;
+  box-shadow: var(--shadow);
+}
+.toast.success { border-color: var(--green); color: var(--green); }
+.toast.error   { border-color: var(--red);   color: var(--red); }
+.toast.info    { border-color: var(--cyan);  color: var(--cyan); }
+
+/* ─── Spinner ─────────────────────────────────────────────── */
+.spinner {
+  width: 16px; height: 16px; border-radius: 50%;
+  border: 2px solid var(--border2);
+  border-top-color: var(--cyan);
+  animation: spin 0.7s linear infinite;
+  display: inline-block; vertical-align: middle;
+}
+
+/* ─── Responsive ──────────────────────────────────────────── */
+@media (max-width: 900px) {
+  #main          { grid-template-columns: 1fr; }
+  #stats-bar     { grid-template-columns: repeat(3, 1fr); }
+  #sidebar       { display: none; }
+  .block-row     { grid-template-columns: 50px 1fr 60px 60px; }
+  .block-row > :nth-child(5) { display: none; }
+}
+@media (max-width: 580px) {
+  #stats-bar { grid-template-columns: repeat(2, 1fr); }
+  #search-wrap { display: none; }
+  .block-row { grid-template-columns: 50px 1fr 55px; }
+  .block-row > :nth-child(4) { display: none; }
+}
+</style>
+</head>
+<body>
+
+<!-- ═══ Top Bar ══════════════════════════════════════════════ -->
+<div id="topbar">
+  <a class="logo" href="/explorer">
+    <div class="logo-icon">₿</div>
+    Dorian<span class="drn">Coin</span>
+    <span style="font-size:0.65rem;color:var(--text3);font-weight:400;margin-top:2px">DRN</span>
+  </a>
+  <div id="status-dot" class="loading"></div>
+  <span id="status-label">connecting…</span>
+  <span id="node-id" style="display:none"></span>
+
+  <div id="search-wrap">
+    <input id="search-input" type="text" placeholder="Search address  DRN1…" autocomplete="off" spellcheck="false">
+    <button id="search-btn" title="Search">⌕</button>
+  </div>
+
+  <div class="topbar-right">
+    <span id="refresh-time"></span>
+    <button id="mine-btn" title="Mine a new block">⛏ Mine</button>
+  </div>
+</div>
+
+<!-- ═══ Stats Bar ════════════════════════════════════════════ -->
+<div id="stats-bar">
+  <div class="stat-card">
+    <div class="stat-label">Chain Height</div>
+    <div class="stat-value cyan" id="s-height">—</div>
+    <div class="stat-sub" id="s-height-sub">blocks</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Difficulty</div>
+    <div class="stat-value" id="s-diff">—</div>
+    <div class="stat-sub" id="s-diff-sub">leading zeros</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Pending Txns</div>
+    <div class="stat-value" id="s-pending">—</div>
+    <div class="stat-sub">in mempool</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">DRN Mined</div>
+    <div class="stat-value green" id="s-supply">—</div>
+    <div class="stat-sub">× 50 DRN/block</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">DB Size</div>
+    <div class="stat-value" id="s-dbsize">—</div>
+    <div class="stat-sub" id="s-dbtxns">transactions</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Peers</div>
+    <div class="stat-value" id="s-peers">—</div>
+    <div class="stat-sub">connected nodes</div>
+  </div>
+</div>
+
+<!-- ═══ Main Content ═════════════════════════════════════════ -->
+<div id="main">
+
+  <!-- Left: Block List -->
+  <div class="panel">
+    <div class="panel-hdr">
+      <span>⬡</span> Latest Blocks
+      <span class="badge" id="block-count-badge">0</span>
+    </div>
+    <div id="blocks-list">
+      <div style="padding:2rem;text-align:center;color:var(--text3)">
+        <div class="spinner" style="width:24px;height:24px;margin:0 auto 0.75rem"></div>
+        Loading chain…
+      </div>
+    </div>
+  </div>
+
+  <!-- Right: Sidebar -->
+  <div id="sidebar">
+
+    <!-- Address Search Result -->
+    <div id="addr-result">
+      <h4>ADDRESS</h4>
+      <div id="addr-addr" class="mono truncate" style="color:var(--text2);font-size:0.75rem;margin-bottom:0.3rem"></div>
+      <div id="addr-balance-big">0.00 <span style="font-size:0.7rem;color:var(--text2)">DRN</span></div>
+      <div id="addr-history-table"></div>
+    </div>
+
+    <!-- Retarget Status -->
+    <div class="panel">
+      <div class="panel-hdr"><span>◎</span> Difficulty Retargeting</div>
+      <div id="retarget-progress-wrap" style="padding:0.6rem 1.1rem 0">
+        <div style="display:flex;justify-content:space-between;font-size:0.72rem;color:var(--text2);margin-bottom:0.25rem">
+          <span id="rt-blocks-done">0 blocks</span>
+          <span id="rt-target">Next retarget</span>
+        </div>
+        <div class="progress-track">
+          <div class="progress-fill" id="rt-progress" style="width:0%"></div>
+        </div>
+      </div>
+      <div class="retarget-grid">
+        <div class="retarget-item"><div class="lbl">Current Diff</div><div class="val cyan" id="rt-diff">—</div></div>
+        <div class="retarget-item"><div class="lbl">Target Time</div><div class="val" id="rt-target-time">—</div></div>
+        <div class="retarget-item"><div class="lbl">Avg Block Time</div><div class="val" id="rt-avg">—</div></div>
+        <div class="retarget-item"><div class="lbl">Retargets Done</div><div class="val" id="rt-count">—</div></div>
+      </div>
+    </div>
+
+    <!-- Mempool -->
+    <div class="panel">
+      <div class="panel-hdr"><span>📋</span> Mempool <span class="badge" id="mempool-badge">0</span></div>
+      <div id="mempool-list"><div class="mempool-empty">No pending transactions</div></div>
+    </div>
+
+    <!-- Peers -->
+    <div class="panel">
+      <div class="panel-hdr"><span>🌐</span> Peer Nodes</div>
+      <div id="peers-list"><div class="no-peers">No peers connected</div></div>
+    </div>
+
+  </div><!-- /sidebar -->
+</div><!-- /main -->
+
+<!-- ═══ Block Detail Panel ════════════════════════════════════ -->
+<div id="detail-overlay"></div>
+<div id="detail-panel" class="hidden">
+  <div id="detail-hdr">
+    <div id="detail-title">Block #0</div>
+    <button id="detail-close" title="Close">✕</button>
+  </div>
+  <div id="detail-body"></div>
+</div>
+
+<!-- ═══ Toast Container ══════════════════════════════════════ -->
+<div id="toast-container"></div>
+
+<script>
+/* ═══════════════════════════════════════════════════════════
+   DorianCoin Block Explorer — client JS
+   Polls the node REST API every 3 s for live data.
+   ══════════════════════════════════════════════════════════ */
+
+const POLL_MS  = 3000;
+const BASE_URL = '';            // same origin as node.py
+let   chain      = [];
+let   nodeInfo   = {};
+let   rtStatus   = {};
+let   prevHeight = -1;
+let   polling    = true;
+
+// ─── Helpers ──────────────────────────────────────────────
+function $(id) { return document.getElementById(id); }
+
+function fmt(str, len=12) {
+  if (!str) return '—';
+  return str.length > len*2+3 ? str.slice(0,len)+'…'+str.slice(-len) : str;
+}
+
+function fmtHash(h) {
+  if (!h) return '—';
+  const zeros = h.match(/^(0+)/)?.[1] ?? '';
+  const rest  = h.slice(zeros.length, zeros.length+22);
+  return `<span class="zeros">${zeros}</span>${rest}…`;
+}
+
+function timeAgo(ts) {
+  const s = Math.round(Date.now()/1000 - ts);
+  if (s <   2) return 'just now';
+  if (s <  60) return `${s}s ago`;
+  if (s < 3600) return `${Math.round(s/60)}m ago`;
+  return `${Math.round(s/3600)}h ago`;
+}
+
+function diffColor(d) {
+  if (d <= 2) return 'var(--green)';
+  if (d <= 4) return 'var(--cyan)';
+  if (d <= 6) return 'var(--orange)';
+  return 'var(--red)';
+}
+
+function showToast(msg, type='info', ms=3000) {
+  const t = document.createElement('div');
+  t.className = `toast ${type}`;
+  t.textContent = msg;
+  $('toast-container').appendChild(t);
+  setTimeout(() => t.remove(), ms);
+}
+
+function copyText(text) {
+  navigator.clipboard?.writeText(text)
+    .then(()  => showToast('Copied to clipboard', 'success', 1500))
+    .catch(()  => showToast('Copy failed', 'error', 1500));
+}
+
+// ─── Fetch wrapper ─────────────────────────────────────────
+async function api(path) {
+  const r = await fetch(BASE_URL + path);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}
+
+// ─── Status dot ────────────────────────────────────────────
+function setStatus(state, label) {
+  const dot = $('status-dot');
+  dot.className = state;
+  $('status-label').textContent = label;
+}
+
+// ─── Stats bar update ──────────────────────────────────────
+function updateStats() {
+  const height = chain.length;
+  $('s-height').textContent  = height.toLocaleString();
+  $('s-diff').textContent    = nodeInfo.difficulty ?? '—';
+  $('s-diff').style.color    = diffColor(nodeInfo.difficulty ?? 0);
+  $('s-pending').textContent = nodeInfo.pending_txns ?? '—';
+  $('s-supply').textContent  = ((height-1) * 50).toLocaleString();
+
+  const stor = nodeInfo.storage;
+  if (stor) {
+    $('s-dbsize').textContent = `${stor.db_size_kb} KB`;
+    $('s-dbtxns').textContent = `${stor.txns_stored.toLocaleString()} txns in DB`;
+  }
+  $('s-peers').textContent = (nodeInfo.peers?.length ?? 0);
+  $('block-count-badge').textContent = height;
+  if (nodeInfo.node_id) {
+    $('node-id').textContent = nodeInfo.node_id;
+    $('node-id').style.display = '';
+  }
+}
+
+// ─── Retarget panel ────────────────────────────────────────
+function updateRetarget() {
+  const rt = nodeInfo.retarget_status;
+  if (!rt) return;
+  $('rt-diff').textContent       = rt.current_difficulty;
+  $('rt-target-time').textContent= `${rt.target_block_time_s}s`;
+  $('rt-avg').textContent        = `${rt.avg_block_time_s}s`;
+  $('rt-count').textContent      = rt.retarget_count;
+
+  const done  = rt.retarget_interval - rt.blocks_until_retarget;
+  const total = rt.retarget_interval;
+  const pct   = Math.min(100, Math.round((done / total) * 100));
+  $('rt-progress').style.width = `${pct}%`;
+  $('rt-blocks-done').textContent = `${done} of ${total} blocks`;
+  $('rt-target').textContent      = `#${rt.next_retarget_at}`;
+}
+
+// ─── Mempool panel ─────────────────────────────────────────
+function updateMempool() {
+  const pending = nodeInfo.pending_txns ?? 0;
+  $('mempool-badge').textContent = pending;
+
+  // Fetch live pending txns
+  fetch(BASE_URL + '/transactions/pending')
+    .then(r => r.json())
+    .then(data => {
+      const list = $('mempool-list');
+      if (!data.pending?.length) {
+        list.innerHTML = '<div class="mempool-empty">No pending transactions</div>';
+        return;
+      }
+      list.innerHTML = data.pending.map(tx => `
+        <div class="mempool-tx">
+          <span class="mempool-addr">${fmt(tx.sender,8)} → ${fmt(tx.recipient,8)}</span>
+          <span class="mempool-amount">${tx.amount} DRN</span>
+        </div>`).join('');
+    }).catch(() => {});
+}
+
+// ─── Peers panel ───────────────────────────────────────────
+function updatePeers() {
+  const peers = nodeInfo.peers ?? [];
+  const list  = $('peers-list');
+  if (!peers.length) {
+    list.innerHTML = '<div class="no-peers">No peers connected</div>';
+    return;
+  }
+  list.innerHTML = peers.map(p =>
+    `<div class="peer-item">🔗 ${p}</div>`
+  ).join('');
+}
+
+// ─── Block List ────────────────────────────────────────────
+function renderBlocks() {
+  const container = $('blocks-list');
+
+  // Show newest first
+  const sorted = [...chain].reverse();
+  const isNew  = chain.length !== prevHeight && prevHeight !== -1;
+
+  container.innerHTML = sorted.map((b, idx) => {
+    const isGenesis = b.index === 0;
+    const newCls    = (idx === 0 && isNew) ? ' new-block' : '';
+    const genCls    = isGenesis ? ' genesis' : '';
+    const txCount   = (b.transactions ?? []).length;
+    const dc        = diffColor(b.difficulty ?? 2);
+    const ago       = timeAgo(b.timestamp);
+
+    return `
+    <div class="block-row${newCls}${genCls}" onclick="showBlockDetail(${b.index})" id="br-${b.index}">
+      <div class="block-num">#${b.index}</div>
+      <div class="block-hash-wrap">
+        <div class="label">HASH</div>
+        <div class="block-hash">${fmtHash(b.hash)}</div>
+      </div>
+      <div class="block-txns">
+        <div class="num">${txCount}</div>
+        <div class="lbl">txns</div>
+      </div>
+      <div class="block-time">${ago}</div>
+      <div class="diff-pill" style="background:${dc}22;color:${dc}">diff ${b.difficulty}</div>
+    </div>`;
+  }).join('');
+}
+
+// ─── Block Detail Panel ────────────────────────────────────
+function showBlockDetail(index) {
+  const b = chain[index];
+  if (!b) return;
+
+  $('detail-title').textContent = `Block #${b.index}`;
+  $('detail-overlay').style.display = 'block';
+  $('detail-panel').classList.remove('hidden');
+
+  const txRows = (b.transactions ?? []).map(tx => {
+    const isCoinbase = tx.sender === 'NETWORK';
+    return `<tr>
+      <td class="${isCoinbase ? 'coinbase' : ''}">${isCoinbase ? '🏦 NETWORK' : fmt(tx.sender, 6)}</td>
+      <td>${fmt(tx.recipient, 6)}</td>
+      <td class="amount">${tx.amount} DRN</td>
+    </tr>`;
+  }).join('');
+
+  const prevHashDisplay = b.index === 0
+    ? '<span class="dimmer">Genesis — no previous block</span>'
+    : `<span class="mono">${b.previous_hash}</span>`;
+
+  $('detail-body').innerHTML = `
+    <div class="detail-row">
+      <div class="lbl">Block Index</div>
+      <div class="val big">#${b.index}</div>
+    </div>
+    <div class="detail-row">
+      <div class="lbl">Hash &nbsp;<button onclick="copyText('${b.hash}')" style="background:none;border:none;cursor:pointer;color:var(--text3);font-size:0.7rem">copy</button></div>
+      <div class="val" style="color:var(--cyan)">${b.hash}</div>
+    </div>
+    <div class="detail-row">
+      <div class="lbl">Previous Hash</div>
+      <div class="val">${prevHashDisplay}</div>
+    </div>
+    <div class="detail-row">
+      <div class="lbl">Timestamp</div>
+      <div class="val">${new Date(b.timestamp*1000).toLocaleString()}  <span class="dimmer">(${timeAgo(b.timestamp)})</span></div>
+    </div>
+    <div class="detail-row">
+      <div class="lbl">Nonce</div>
+      <div class="val">${b.nonce?.toLocaleString()}</div>
+    </div>
+    <div class="detail-row">
+      <div class="lbl">Difficulty</div>
+      <div class="val" style="color:${diffColor(b.difficulty)}">${b.difficulty} leading zeros</div>
+    </div>
+    <div class="detail-row">
+      <div class="lbl">Transactions (${(b.transactions??[]).length})</div>
+      <table class="tx-table">
+        <thead><tr><th>From</th><th>To</th><th style="text-align:right">Amount</th></tr></thead>
+        <tbody>${txRows}</tbody>
+      </table>
+    </div>`;
+}
+
+function closeDetail() {
+  $('detail-overlay').style.display = 'none';
+  $('detail-panel').classList.add('hidden');
+}
+$('detail-overlay').onclick = closeDetail;
+$('detail-close').onclick   = closeDetail;
+
+// ─── Address Search ────────────────────────────────────────
+async function searchAddress(addr) {
+  if (!addr.trim()) return;
+  try {
+    const [balData, histData] = await Promise.all([
+      api(`/balance/${addr.trim()}`),
+      api(`/history/${addr.trim()}`),
+    ]);
+
+    $('addr-addr').textContent     = addr;
+    $('addr-balance-big').innerHTML = `${balData.balance.toFixed(2)} <span style="font-size:0.7rem;color:var(--text2)">DRN</span>`;
+
+    const txs = histData.transactions ?? [];
+    $('addr-history-table').innerHTML = txs.length ? `
+      <table class="tx-table" style="margin-top:0.5rem">
+        <thead><tr><th>Block</th><th>From</th><th>To</th><th style="text-align:right">DRN</th></tr></thead>
+        <tbody>${txs.map(tx => `<tr>
+          <td>#${tx.block_index}</td>
+          <td>${fmt(tx.sender,5)}</td>
+          <td>${fmt(tx.recipient,5)}</td>
+          <td class="amount">${Number(tx.amount).toFixed(2)}</td>
+        </tr>`).join('')}</tbody>
+      </table>` : '<div class="dimmer" style="font-size:0.75rem;padding:0.5rem 0">No transactions yet</div>';
+
+    $('addr-result').style.display = 'block';
+  } catch(e) {
+    showToast('Address lookup failed', 'error');
+  }
+}
+
+$('search-btn').onclick = () => searchAddress($('search-input').value);
+$('search-input').onkeydown = e => { if (e.key === 'Enter') searchAddress($('search-input').value); };
+
+// ─── Mining ────────────────────────────────────────────────
+$('mine-btn').onclick = async () => {
+  const btn = $('mine-btn');
+  btn.textContent = '⏳ Mining…';
+  btn.classList.add('mining');
+  try {
+    const data = await api('/mine');
+    showToast(`Block #${data.block.index} mined! Reward: ${data.block_reward} DRN`, 'success', 4000);
+    await refresh();
+  } catch(e) {
+    showToast('Mining failed — node busy or not ready', 'error');
+  } finally {
+    btn.textContent = '⛏ Mine';
+    btn.classList.remove('mining');
+  }
+};
+
+// ─── Main Refresh Loop ─────────────────────────────────────
+async function refresh() {
+  try {
+    const [chainData, info] = await Promise.all([
+      api('/chain'),
+      api('/'),
+    ]);
+
+    chain    = chainData.chain;
+    nodeInfo = info;
+
+    const newHeight = chain.length;
+    const isNew     = newHeight !== prevHeight && prevHeight !== -1;
+
+    setStatus('online', 'Online');
+    updateStats();
+    updateRetarget();
+    updateMempool();
+    updatePeers();
+    renderBlocks();
+
+    if (isNew) {
+      showToast(`New block #${newHeight - 1} added`, 'info', 2000);
+    }
+    prevHeight = newHeight;
+    $('refresh-time').textContent = 'Updated ' + new Date().toLocaleTimeString();
+
+  } catch(e) {
+    setStatus('offline', 'Node offline');
+    $('s-height').textContent = '—';
+    $('blocks-list').innerHTML = `
+      <div style="padding:2rem;text-align:center;color:var(--text3)">
+        <div style="font-size:2rem;margin-bottom:0.5rem">⚡</div>
+        Node is offline or not ready<br>
+        <span style="font-size:0.75rem">Start with: python node.py --port 5000 --difficulty 2</span>
+      </div>`;
+  }
+}
+
+// ─── Boot ──────────────────────────────────────────────────
+setStatus('loading', 'Connecting…');
+refresh();
+setInterval(refresh, POLL_MS);
+
+// Pause polling when tab hidden to save resources
+document.addEventListener('visibilitychange', () => {
+  polling = !document.hidden;
+});
+</script>
+</body>
+</html>
