@@ -1,0 +1,514 @@
+"""
+blockchain.py -- DorianCoin (DRN) Core Blockchain Engine
+=========================================================
+Stage 1: Block structure, SHA-256 hashing, Proof-of-Work, chain validation.
+Stage 2: ECDSA signature verification on every incoming transaction.
+Stage 3: Peer chain validation + load from JSON (for REST node consensus).
+Stage 4: Automatic difficulty retargeting every N blocks.
+
+Later stages will add:
+  - UTXO model / double-spend protection
+  - Persistent storage (SQLite)
+  - Mempool fee prioritisation
+"""
+
+import hashlib
+import json
+import time
+
+# Wallet is imported lazily inside add_transaction to avoid any potential
+# circular-import issues when node.py later imports both modules.
+# (wallet.py never imports blockchain.py, so a top-level import is also safe.)
+from wallet import Wallet
+
+
+# ---------------------------------------------------------------------------
+# Block
+# ---------------------------------------------------------------------------
+
+class Block:
+    """A single block in the DorianCoin blockchain.
+
+    Attributes
+    ----------
+    index           : Position in the chain (0 = genesis).
+    timestamp       : UNIX time the block object was created.
+    transactions    : List of transaction dicts included in this block.
+    previous_hash   : Hash of the preceding block (links the chain).
+    nonce           : Counter incremented during Proof-of-Work mining.
+    difficulty      : Number of leading zeros required in the block hash.
+    hash            : Final SHA-256 hash — set after mine() completes.
+    """
+
+    def __init__(self, index: int, transactions: list,
+                 previous_hash: str, difficulty: int = 4):
+        self.index = index
+        self.timestamp = time.time()
+        self.transactions = transactions
+        self.previous_hash = previous_hash
+        self.nonce = 0
+        self.difficulty = difficulty
+        self.hash: str | None = None
+
+    # ------------------------------------------------------------------
+    # Hashing
+    # ------------------------------------------------------------------
+
+    def calculate_hash(self) -> str:
+        """Return the SHA-256 hex-digest of the block's canonical data.
+
+        The timestamp is intentionally excluded from the nonce loop so
+        that two miners working in parallel on the same block produce
+        different hash sequences (they started at different real times).
+        The timestamp is locked-in when mine() is called and never
+        mutated again, giving a deterministic result for validation.
+        """
+        block_data = {
+            "index":         self.index,
+            "timestamp":     self.timestamp,
+            "transactions":  self.transactions,
+            "previous_hash": self.previous_hash,
+            "nonce":         self.nonce,
+        }
+        encoded = json.dumps(block_data, sort_keys=True).encode()
+        return hashlib.sha256(encoded).hexdigest()
+
+    # ------------------------------------------------------------------
+    # Proof-of-Work
+    # ------------------------------------------------------------------
+
+    def mine(self) -> None:
+        """Increment nonce until the block hash starts with `difficulty`
+        leading zeros — the core Proof-of-Work loop.
+
+        Bitcoin calls the target "nBits"; we keep it simple here and use
+        a fixed leading-zero count. Difficulty retargeting will be added
+        in Stage 4.
+        """
+        target = "0" * self.difficulty
+        while True:
+            self.hash = self.calculate_hash()
+            if self.hash.startswith(target):
+                return          # valid hash found → stop
+            self.nonce += 1
+
+    # ------------------------------------------------------------------
+    # Serialisation helpers (used by the REST node later)
+    # ------------------------------------------------------------------
+
+    def to_dict(self) -> dict:
+        """Return a plain-dict representation of the block."""
+        return {
+            "index":         self.index,
+            "timestamp":     self.timestamp,
+            "transactions":  self.transactions,
+            "previous_hash": self.previous_hash,
+            "nonce":         self.nonce,
+            "difficulty":    self.difficulty,
+            "hash":          self.hash,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Block":
+        """Reconstruct a Block from a plain dict (e.g. from a peer's JSON).
+
+        The resulting block has its hash and nonce already set — it is NOT
+        re-mined.  Used by Blockchain.load_chain_from_data() and
+        Blockchain.valid_chain_data().
+        """
+        block = cls(
+            index=data["index"],
+            transactions=data["transactions"],
+            previous_hash=data["previous_hash"],
+            difficulty=data["difficulty"],
+        )
+        block.timestamp = data["timestamp"]
+        block.nonce     = data["nonce"]
+        block.hash      = data["hash"]
+        return block
+
+
+# ---------------------------------------------------------------------------
+# Blockchain
+# ---------------------------------------------------------------------------
+
+class Blockchain:
+    """The DorianCoin chain — an ordered list of Blocks.
+
+    Responsibilities:
+      - Create and hold the genesis block.
+      - Buffer incoming transactions until a block is mined.
+      - Mine a new block (Proof-of-Work) and append it to the chain.
+      - Validate the integrity of the whole chain.
+      - Query the DRN balance of any address.
+      - Accept / validate a peer chain received over the network (Stage 3).
+    """
+
+    # ------------------------------------------------------------------
+    # Class-level constants
+    # ------------------------------------------------------------------
+
+    # Block reward paid to the miner (like Bitcoin's coinbase tx).
+    BLOCK_REWARD: int = 50
+
+    def __init__(
+        self,
+        difficulty:        int   = 4,
+        retarget_interval: int   = 10,
+        target_block_time: float = 10.0,
+        min_difficulty:    int   = 1,
+        max_difficulty:    int   = 8,
+    ):
+        """Create a new blockchain.
+
+        Parameters
+        ----------
+        difficulty          Starting PoW difficulty (leading zeros in hash).
+        retarget_interval   Retarget every this many blocks (Bitcoin: 2016).
+        target_block_time   Desired seconds per block   (Bitcoin: 600).
+        min_difficulty      Floor for automatic retargeting.
+        max_difficulty      Ceiling for automatic retargeting.
+        """
+        self.difficulty         = difficulty
+        self.retarget_interval  = retarget_interval
+        self.target_block_time  = target_block_time
+        self.min_difficulty     = min_difficulty
+        self.max_difficulty     = max_difficulty
+
+        self.chain: list                = [self._create_genesis_block()]
+        self.pending_transactions: list = []
+        self.retarget_log: list         = []   # history of every retarget event
+
+    # ------------------------------------------------------------------
+    # Genesis
+    # ------------------------------------------------------------------
+
+    def _create_genesis_block(self) -> Block:
+        """Mine and return the first block (index 0, no previous hash)."""
+        print("Creating genesis block...")
+        genesis = Block(index=0, transactions=[], previous_hash="0",
+                        difficulty=self.difficulty)
+        genesis.mine()
+        print(f"  Genesis hash : {genesis.hash}")
+        print(f"  Genesis nonce: {genesis.nonce}")
+        print()
+        return genesis
+
+    # ------------------------------------------------------------------
+    # Chain accessors
+    # ------------------------------------------------------------------
+
+    def get_latest_block(self) -> Block:
+        return self.chain[-1]
+
+    @property
+    def height(self) -> int:
+        """Number of blocks in the chain (including genesis)."""
+        return len(self.chain)
+
+    # ------------------------------------------------------------------
+    # Transactions
+    # ------------------------------------------------------------------
+
+    def add_transaction(self, transaction: dict) -> int:
+        """Validate and buffer a transaction until the next block is mined.
+
+        Stage 2 enforcement
+        -------------------
+        Every transaction must carry a valid ECDSA signature produced by
+        the private key that corresponds to the `sender` address.  If the
+        signature is missing, forged, or belongs to a different key-pair
+        the transaction is rejected with a ValueError.
+
+        Coinbase / network-reward transactions (sender == 'NETWORK') are
+        generated internally and bypass signature checking.
+
+        Parameters
+        ----------
+        transaction : dict
+            Keys required for user txns:
+              sender, recipient, amount, public_key, signature
+
+        Returns
+        -------
+        int  — index of the block that will confirm this transaction.
+
+        Raises
+        ------
+        ValueError  — if the ECDSA signature is invalid or missing.
+        """
+        if not Wallet.verify_transaction(transaction):
+            sender = transaction.get("sender", "<unknown>")
+            raise ValueError(
+                f"[Blockchain] Rejected transaction from {sender}: "
+                "invalid or missing ECDSA signature."
+            )
+        self.pending_transactions.append(transaction)
+        return self.height  # index of the block that will confirm it
+
+    # ------------------------------------------------------------------
+    # Mining
+    # ------------------------------------------------------------------
+
+    def mine_pending_transactions(self, miner_address: str) -> Block:
+        """Bundle all pending transactions + a coinbase reward into a new
+        block, run Proof-of-Work, and append the block to the chain.
+
+        Parameters
+        ----------
+        miner_address : The DRN address that receives the block reward.
+
+        Returns
+        -------
+        The newly mined and appended Block.
+        """
+        # Coinbase / block-reward transaction (like Bitcoin's first tx)
+        coinbase_tx = {
+            "sender":    "NETWORK",          # freshly minted coins
+            "recipient": miner_address,
+            "amount":    self.BLOCK_REWARD,
+        }
+
+        transactions = self.pending_transactions + [coinbase_tx]
+
+        block = Block(
+            index=len(self.chain),
+            transactions=transactions,
+            previous_hash=self.get_latest_block().hash,
+            difficulty=self.difficulty,
+        )
+
+        print(f"  Mining block {block.index}...")
+        start = time.perf_counter()
+        block.mine()
+        elapsed = time.perf_counter() - start
+
+        print(f"  [OK] Block {block.index} mined in {elapsed:.2f}s")
+        print(f"    Hash  : {block.hash}")
+        print(f"    Nonce : {block.nonce:,}")
+        print(f"    Txns  : {len(transactions)}")
+
+        self.chain.append(block)
+        self.pending_transactions = []
+
+        # Stage 4: attempt difficulty retarget
+        retarget = self._adjust_difficulty()
+        if retarget:
+            tag = "CHANGED" if retarget["changed"] else "no change"
+            print(f"  [Retarget @{retarget['block_height']}] "
+                  f"{retarget['old_difficulty']} -> {retarget['new_difficulty']} "
+                  f"({tag})")
+            print(f"    actual={retarget['actual_time']:.2f}s  "
+                  f"target={retarget['target_time']:.2f}s  "
+                  f"ratio={retarget['ratio']:.3f}x")
+
+        return block
+
+    # ------------------------------------------------------------------
+    # Stage 4 -- Difficulty Retargeting
+    # ------------------------------------------------------------------
+
+    def _adjust_difficulty(self) -> dict:
+        """Retarget PoW difficulty every `retarget_interval` blocks.
+
+        Algorithm (simplified Bitcoin):
+          1. Measure actual wall-clock time for the last N blocks.
+          2. Compare to N * target_block_time.
+          3. Scale: ratio = target_time / actual_time
+               ratio > 1  -> blocks too fast  -> difficulty UP
+               ratio < 1  -> blocks too slow  -> difficulty DOWN
+          4. Clamp ratio to [0.25, 4.0] (Bitcoin's same 4x guard).
+          5. Round to integer; clamp to [min_difficulty, max_difficulty].
+          6. Always appends to self.retarget_log.
+
+        Returns the event dict, or {} if not at an interval boundary.
+        """
+        height = len(self.chain)
+
+        # Fire only at interval boundaries; skip genesis window
+        if height < self.retarget_interval or height % self.retarget_interval != 0:
+            return {}
+
+        start_block = self.chain[-self.retarget_interval]
+        end_block   = self.chain[-1]
+
+        actual_time = end_block.timestamp - start_block.timestamp
+        target_time = self.retarget_interval * self.target_block_time
+
+        # Guard against clock skew / sub-millisecond unit-test runs
+        if actual_time <= 0:
+            actual_time = 1e-6
+
+        # Scale ratio then clamp (prevents 100x swings)
+        raw_ratio = target_time / actual_time
+        ratio     = max(0.25, min(4.0, raw_ratio))
+
+        old_difficulty = self.difficulty
+        new_difficulty = max(
+            self.min_difficulty,
+            min(self.max_difficulty, round(old_difficulty * ratio)),
+        )
+        self.difficulty = new_difficulty
+
+        event = {
+            "block_height":   height,
+            "actual_time":    round(actual_time, 4),
+            "target_time":    round(target_time, 4),
+            "raw_ratio":      round(raw_ratio,   4),
+            "ratio":          round(ratio,        4),
+            "old_difficulty": old_difficulty,
+            "new_difficulty": new_difficulty,
+            "changed":        new_difficulty != old_difficulty,
+        }
+        self.retarget_log.append(event)
+        return event
+
+    def retarget_status(self) -> dict:
+        """Return a snapshot of the current retarget window (for API use)."""
+        height = len(self.chain)
+        mod    = height % self.retarget_interval
+
+        blocks_until    = (self.retarget_interval - mod) if mod else self.retarget_interval
+        window_len      = mod or self.retarget_interval
+        window_start    = self.chain[-window_len]
+        window_elapsed  = self.chain[-1].timestamp - window_start.timestamp
+        avg_block_time  = window_elapsed / window_len if window_len > 1 else 0.0
+
+        return {
+            "current_difficulty":    self.difficulty,
+            "retarget_interval":     self.retarget_interval,
+            "target_block_time_s":   self.target_block_time,
+            "min_difficulty":        self.min_difficulty,
+            "max_difficulty":        self.max_difficulty,
+            "chain_height":          height,
+            "blocks_until_retarget": blocks_until,
+            "next_retarget_at":      height + blocks_until,
+            "avg_block_time_s":      round(avg_block_time, 3),
+            "retarget_count":        len(self.retarget_log),
+            "retarget_log":          self.retarget_log,
+        }
+
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
+
+    def is_valid(self) -> bool:
+        """Verify the integrity of every block in the chain.
+
+        Checks (per block, starting at index 1):
+          1. The stored hash matches a fresh recalculation.
+          2. The previous_hash pointer links correctly to the prior block.
+          3. The hash satisfies the declared difficulty (starts with
+             the right number of leading zeros).
+
+        The genesis block (index 0) is implicitly trusted.
+        """
+        for i in range(1, len(self.chain)):
+            current  = self.chain[i]
+            previous = self.chain[i - 1]
+
+            # 1 — hash integrity
+            if current.hash != current.calculate_hash():
+                print(f"  [!!] Block {i}: hash mismatch (tampered data?)")
+                return False
+
+            # 2 — chain linkage
+            if current.previous_hash != previous.hash:
+                print(f"  [!!] Block {i}: broken chain link")
+                return False
+
+            # 3 — proof-of-work
+            if not current.hash.startswith("0" * current.difficulty):
+                print(f"  [!!] Block {i}: fails proof-of-work check")
+                return False
+
+        return True
+
+    # ------------------------------------------------------------------
+    # Peer / network chain helpers  (Stage 3)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def valid_chain_data(chain_data: list) -> bool:
+        """Validate a chain represented as a list of plain dicts (JSON).
+
+        This is the peer-chain variant of is_valid():  it works on raw
+        dicts received from a network response rather than on local Block
+        objects, so we can check a foreign chain without fully importing it.
+
+        Checks per block (skipping genesis):
+          1. Stored hash matches a fresh recalculation.
+          2. previous_hash links correctly to the preceding block's hash.
+          3. Hash satisfies the declared difficulty (leading zeros).
+        """
+        if not chain_data:
+            return False
+
+        for i in range(1, len(chain_data)):
+            current_data  = chain_data[i]
+            previous_data = chain_data[i - 1]
+
+            # Reconstruct a transient Block object to recompute its hash
+            current = Block.from_dict(current_data)
+
+            # 1 — hash integrity
+            if current.hash != current.calculate_hash():
+                return False
+
+            # 2 — chain linkage
+            if current.previous_hash != previous_data["hash"]:
+                return False
+
+            # 3 — proof-of-work
+            if not current.hash.startswith("0" * current.difficulty):
+                return False
+
+        return True
+
+    def load_chain_from_data(self, chain_data: list) -> None:
+        """Replace the local chain with Block objects reconstructed from
+        a peer's JSON chain data.
+
+        Called by the /nodes/resolve endpoint when a longer valid chain
+        is found among peers.  Pending transactions are intentionally
+        preserved — they haven't been confirmed yet.
+        """
+        self.chain = [Block.from_dict(b) for b in chain_data]
+
+    # ------------------------------------------------------------------
+    # Balance
+    # ------------------------------------------------------------------
+
+    def get_balance(self, address: str) -> float:
+        """Walk every confirmed transaction in the chain and return the
+        net DRN balance for `address`.
+
+        This is a naive full-scan approach.  Stage 4 will replace it
+        with a proper UTXO set for O(1) lookups.
+        """
+        balance = 0.0
+        for block in self.chain:
+            for tx in block.transactions:
+                if tx["recipient"] == address:
+                    balance += tx["amount"]
+                if tx["sender"] == address:
+                    balance -= tx["amount"]
+        return balance
+
+    # ------------------------------------------------------------------
+    # Pretty-print
+    # ------------------------------------------------------------------
+
+    def print_chain(self) -> None:
+        """Dump a human-readable summary of every block."""
+        print("=" * 60)
+        print(f"  DorianCoin Blockchain  (height={self.height})")
+        print("=" * 60)
+        for block in self.chain:
+            label = "GENESIS" if block.index == 0 else f"Block {block.index}"
+            print(f"\n  [{label}]")
+            print(f"    Hash     : {block.hash}")
+            print(f"    PrevHash : {block.previous_hash}")
+            print(f"    Nonce    : {block.nonce:,}")
+            print(f"    Txns     : {len(block.transactions)}")
+        print()
