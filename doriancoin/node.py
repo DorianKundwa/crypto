@@ -221,9 +221,9 @@ def new_transaction():
             "signature":  "3045..."
         }
 
-    The blockchain layer verifies the ECDSA signature before accepting.
-    Forwarded peer transactions are accepted without re-broadcasting to
-    prevent broadcast storms.
+    Stage 2: Verifies the ECDSA signature before accepting.
+    Stage 7: Verifies sender has sufficient funds (confirmed minus
+             any already-pending outgoing) and rejects double-spends.
     """
     tx = request.get_json(silent=True)
     if not tx:
@@ -237,21 +237,50 @@ def new_transaction():
     try:
         confirming_block = blockchain.add_transaction(tx)
     except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
+        # Stage 7: enrich the rejection with current balance info
+        sender = tx.get("sender", "")
+        confirmed_bal  = blockchain.get_balance(sender) if sender else None
+        return jsonify({
+            "error":             str(exc),
+            "sender_balance":    confirmed_bal,
+            "pending_in_mempool": len(blockchain.pending_transactions),
+        }), 400
 
     # Broadcast to peers only if this came from a client (not a peer relay)
-    # We detect peer-relayed txns by the optional "relayed" flag
     if not tx.get("_relayed"):
-        tx["_relayed"] = True           # mark so peers don't re-broadcast
+        tx["_relayed"] = True
         _push_tx_to_peers(tx)
 
     return jsonify({
-        "message":         "Transaction accepted.",
+        "message":          "Transaction accepted.",
         "confirming_block": confirming_block,
-        "sender":          tx["sender"],
-        "recipient":       tx["recipient"],
-        "amount":          tx["amount"],
+        "sender":           tx["sender"],
+        "recipient":        tx["recipient"],
+        "amount":           tx["amount"],
+        "mempool_size":     len(blockchain.pending_transactions),
     }), 201
+
+
+@app.route("/utxo", methods=["GET"])
+def get_utxo():
+    """Return a full balance snapshot of every address on the chain.
+
+    Stage 7 — each entry shows:
+      confirmed   -- on-chain balance (all mined blocks)
+      pending_out -- total outgoing in the current mempool
+      available   -- spendable right now  (confirmed - pending_out)
+
+    Example response::
+
+        {
+          "DRN1Alice...": {"confirmed": 250.0, "pending_out": 10.0, "available": 240.0},
+          "DRN1Bob..":   {"confirmed":  10.0, "pending_out":  0.0, "available":  10.0}
+        }
+    """
+    if not _node_ready:
+        return jsonify({"status": "initialising"}), 503
+    return jsonify(blockchain.get_utxo_snapshot())
+
 
 
 # ---------------------------------------------------------------------------
@@ -523,7 +552,9 @@ if __name__ == "__main__":
     print(f"    GET  http://localhost:{args.port}/mine")
     print(f"    GET  http://localhost:{args.port}/difficulty")
     print(f"    GET  http://localhost:{args.port}/storage")
+    print(f"    GET  http://localhost:{args.port}/utxo")
     print(f"    POST http://localhost:{args.port}/transactions/new")
+    print(f"    GET  http://localhost:{args.port}/transactions/pending")
     print(f"    GET  http://localhost:{args.port}/balance/<address>")
     print(f"    GET  http://localhost:{args.port}/history/<address>")
     print(f"    POST http://localhost:{args.port}/nodes/register")

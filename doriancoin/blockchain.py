@@ -6,11 +6,12 @@ Stage 2: ECDSA signature verification on every incoming transaction.
 Stage 3: Peer chain validation + load from JSON (for REST node consensus).
 Stage 4: Automatic difficulty retargeting every N blocks.
 Stage 5: Persistent SQLite storage -- chain survives node restarts.
+Stage 6: Block Explorer served from node.py GET /explorer.
+Stage 7: UTXO balance tracking + double-spend protection.
 
 Later stages will add:
-  - UTXO model / double-spend protection
   - Mempool fee prioritisation
-  - Block Explorer UI
+  - CLI wallet tool
 """
 
 import hashlib
@@ -22,6 +23,12 @@ from typing import Optional
 # circular-import issues when node.py later imports both modules.
 # (wallet.py never imports blockchain.py, so a top-level import is also safe.)
 from wallet import Wallet
+
+# UTXOState provides balance validation and double-spend detection (Stage 7).
+try:
+    from utxo import UTXOState
+except ImportError:
+    UTXOState = None   # type: ignore
 
 # BlockchainStorage is optional — only imported when a DB path is supplied.
 try:
@@ -268,15 +275,27 @@ class Blockchain:
     def add_transaction(self, transaction: dict) -> int:
         """Validate and buffer a transaction until the next block is mined.
 
-        Stage 2 enforcement
-        -------------------
+        Stage 2 enforcement  (ECDSA)
+        ----------------------------
         Every transaction must carry a valid ECDSA signature produced by
         the private key that corresponds to the `sender` address.  If the
         signature is missing, forged, or belongs to a different key-pair
         the transaction is rejected with a ValueError.
 
+        Stage 7 enforcement  (UTXO / double-spend)
+        -------------------------------------------
+        After the signature is verified, the transaction is checked against
+        the confirmed chain balance AND the current mempool:
+
+          1. Coinbase forgery  -- only NETWORK may set sender='NETWORK'
+          2. Positive amount   -- amount > 0
+          3. Self-send         -- sender != recipient
+          4. Available balance -- confirmed - pending_outgoing >= amount
+          5. Duplicate mempool -- identical tx (same sig) already pending
+
         Coinbase / network-reward transactions (sender == 'NETWORK') are
-        generated internally and bypass signature checking.
+        generated internally and bypass signature checking but still hit
+        the UTXOState coinbase-forgery rule for externally submitted txns.
 
         Parameters
         ----------
@@ -286,18 +305,30 @@ class Blockchain:
 
         Returns
         -------
-        int  — index of the block that will confirm this transaction.
+        int  -- index of the block that will confirm this transaction.
 
         Raises
         ------
-        ValueError  — if the ECDSA signature is invalid or missing.
+        ValueError  -- if the ECDSA signature is invalid, balance is
+                       insufficient, or any other pre-flight check fails.
         """
+        # ── Stage 2: ECDSA signature check ────────────────────────
         if not Wallet.verify_transaction(transaction):
             sender = transaction.get("sender", "<unknown>")
             raise ValueError(
                 f"[Blockchain] Rejected transaction from {sender}: "
                 "invalid or missing ECDSA signature."
             )
+
+        # ── Stage 7: UTXO balance + double-spend check ─────────────
+        if UTXOState is not None:
+            snapshot = UTXOState(self.chain, storage=self.storage)
+            ok, reason = snapshot.validate_transaction(
+                transaction, self.pending_transactions
+            )
+            if not ok:
+                raise ValueError(f"[Blockchain] Transaction rejected: {reason}")
+
         self.pending_transactions.append(transaction)
         return self.height  # index of the block that will confirm it
 
@@ -566,6 +597,31 @@ class Blockchain:
                 if tx["sender"] == address:
                     balance -= tx["amount"]
         return balance
+
+    def get_utxo_snapshot(self) -> dict:
+        """Return confirmed balances and mempool-aware available balances.
+
+        Used by GET /utxo.  Shows every address that has ever received DRN,
+        their confirmed on-chain balance, their pending outgoing amount, and
+        their spendable (available) balance.
+
+        Stage 7: delegates to UTXOState for consistent logic.
+        """
+        if UTXOState is None:
+            return {"error": "UTXOState module not available"}
+
+        snapshot = UTXOState(self.chain, storage=self.storage)
+        confirmed = snapshot.all_confirmed_balances()
+
+        result = {}
+        for addr, bal in confirmed.items():
+            pending_out = snapshot.pending_outgoing(addr, self.pending_transactions)
+            result[addr] = {
+                "confirmed":    round(bal, 8),
+                "pending_out":  round(pending_out, 8),
+                "available":    round(bal - pending_out, 8),
+            }
+        return result
 
     # ------------------------------------------------------------------
     # Pretty-print
