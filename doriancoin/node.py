@@ -291,10 +291,20 @@ def get_utxo():
 def mine():
     """Run Proof-of-Work on pending transactions and claim the block reward.
 
+    Query Parameters
+    ----------------
+    miner : str, optional
+        DRN address to receive the block reward.  Defaults to the node's
+        built-in miner wallet if omitted.
+
     This endpoint blocks until the hash target is found (difficulty=4 is
     a few seconds max).  Notifies all peers to pull-resolve after success.
     """
-    new_block = blockchain.mine_pending_transactions(miner_wallet.address)
+    # Stage 8: allow caller to specify a miner address (e.g. CLI wallet)
+    req_miner = request.args.get("miner", "").strip()
+    reward_address = req_miner if req_miner else miner_wallet.address
+
+    new_block = blockchain.mine_pending_transactions(reward_address)
 
     # Ask peers to sync  (they'll call /nodes/resolve on themselves)
     _pull_resolve_from_peers()
@@ -302,9 +312,9 @@ def mine():
     resp = {
         "message":         f"Block {new_block.index} mined successfully!",
         "block":            new_block.to_dict(),
-        "miner":            miner_wallet.address,
+        "miner_address":    reward_address,
         "block_reward":     Blockchain.BLOCK_REWARD,
-        "miner_balance":    blockchain.get_balance(miner_wallet.address),
+        "miner_balance":    blockchain.get_balance(reward_address),
         "difficulty":       blockchain.difficulty,
     }
     # Include retarget info if one just fired

@@ -1,218 +1,202 @@
 """
-wallet_demo.py — DorianCoin Stage 2: Wallets + Signed Transactions
-===================================================================
-Demonstrates:
-  1.  Generating real ECDSA wallets with DRN addresses
-  2.  Creating and signing transactions
-  3.  Blockchain rejecting forged / unsigned transactions
-  4.  Balance accounting across multiple signed transfers
-  5.  Saving and reloading a wallet from disk
+wallet_demo.py -- DorianCoin Stage 8: CLI Wallet Demo
+======================================================
+Launches a background DorianCoin node, then exercises every drn_wallet.py
+command against it — no manual curl needed.
+
+What this demo does
+-------------------
+  1. Start node on port 5100 (difficulty 2, background thread)
+  2. Wait for node to be ready
+  3. drn_wallet.py new        -- create Alice's wallet
+  4. drn_wallet.py address    -- verify the key file
+  5. drn_wallet.py info       -- inspect node stats
+  6. drn_wallet.py mine       -- mine block 1 (Alice earns 50 DRN)
+  7. drn_wallet.py balance    -- Alice's confirmed balance
+  8. drn_wallet.py send       -- Alice -> Bob 15 DRN
+  9. drn_wallet.py utxo       -- whole network snapshot
+ 10. drn_wallet.py mine       -- mine block 2 (confirms Alice->Bob)
+ 11. drn_wallet.py history    -- Alice's full tx history
+ 12. drn_wallet.py blocks     -- recent 5 blocks
+ 13. drn_wallet.py balance    -- Bob's balance post-confirmation
 
 Run:
-    python wallet_demo.py
+    python -u doriancoin/wallet_demo.py    (from repo root)
+    python -u wallet_demo.py              (from doriancoin/)
 """
 
 import os
-from wallet import Wallet
-from blockchain import Blockchain
+import sys
+import time
+import subprocess
 
-DIVIDER = "=" * 60
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+from wallet  import Wallet
+import drn_wallet as W   # import the CLI module directly
+
+DIVIDER  = "=" * 66
+PORT     = 5100
+NODE     = f"http://localhost:{PORT}"
+KEYS_DIR = os.path.join(_HERE, "data", "demo_keys")
+ALICE_PEM = os.path.join(KEYS_DIR, "alice.pem")
+BOB_PEM   = os.path.join(KEYS_DIR, "bob.pem")
+
+# Override the module-level node URL and colour flag
+W._NODE  = NODE
+W._COLOR = True
 
 
-def section(title: str) -> None:
+def banner(title: str) -> None:
     print(f"\n{DIVIDER}")
     print(f"  {title}")
     print(DIVIDER)
+    sys.stdout.flush()
 
 
-def balances(chain: Blockchain, **wallets) -> None:
-    """Print balances for a dict of name→wallet pairs."""
-    for name, w in wallets.items():
-        bal = chain.get_balance(w.address)
-        print(f"  {name:<8} {w.address}  =>  {bal} DRN")
+def step(n: int, desc: str) -> None:
+    print(f"\n{'─'*66}")
+    print(f"  Step {n:02d}: {desc}")
+    print(f"{'─'*66}")
+    sys.stdout.flush()
 
 
-# ---------------------------------------------------------------------------
-# 1. Generate wallets
-# ---------------------------------------------------------------------------
-section("1. Generating Wallets")
-
-alice = Wallet()
-bob   = Wallet()
-miner = Wallet()
-
-print(f"  Alice : {alice.address}")
-print(f"  Bob   : {bob.address}")
-print(f"  Miner : {miner.address}")
-
-# Quick sanity check — two wallets must never produce the same address
-assert alice.address != bob.address != miner.address, "Address collision!"
-print("\n  [OK] All three addresses are unique.")
+def run_cmd(*args) -> int:
+    """Run a drn_wallet command using its main() function directly."""
+    argv = ["--node", NODE, "--no-color"] + list(str(a) for a in args)
+    print(f"\n  $ python drn_wallet.py {' '.join(str(a) for a in args)}")
+    print()
+    return W.main(argv)
 
 
-# ---------------------------------------------------------------------------
-# 2. Inspect a transaction dict before it hits the chain
-# ---------------------------------------------------------------------------
-section("2. Inspecting a Signed Transaction")
-
-sample_tx = miner.create_transaction(alice.address, 20)
-print("  Keys in a signed transaction:")
-for k, v in sample_tx.items():
-    display = v if k != "public_key" else v[:24] + "..."
-    display = display if k != "signature"  else display[:24] + "..."
-    print(f"    {k:<12}: {display}")
-
-verified = Wallet.verify_transaction(sample_tx)
-print(f"\n  Signature valid? {verified}")
-assert verified, "Signature verification failed!"
+def start_node():
+    """Launch node.py in a subprocess on PORT."""
+    node_script = os.path.join(_HERE, "node.py")
+    proc = subprocess.Popen(
+        [sys.executable, "-u", node_script,
+         "--port",       str(PORT),
+         "--difficulty", "2"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        cwd=_HERE,
+    )
+    return proc
 
 
-# ---------------------------------------------------------------------------
-# 3. Start the blockchain and mine the first block
-# ---------------------------------------------------------------------------
-section("3. Starting Blockchain  (difficulty=4)")
+def wait_for_node(timeout: int = 40) -> bool:
+    """Poll until / returns 200 or timeout."""
+    try:
+        import requests
+    except ImportError:
+        print("  [ERROR] pip install requests  is required for this demo")
+        return False
 
-chain = Blockchain(difficulty=4)
-
-print("\n  Mining block 1  (miner earns block reward)...")
-chain.mine_pending_transactions(miner.address)
-print()
-balances(chain, Alice=alice, Bob=bob, Miner=miner)
-
-
-# ---------------------------------------------------------------------------
-# 4. Miner → Alice: 20 DRN (signed)
-# ---------------------------------------------------------------------------
-section("4. Miner sends Alice 20 DRN  (signed transaction)")
-
-tx1 = miner.create_transaction(alice.address, 20)
-block_idx = chain.add_transaction(tx1)
-print(f"\n  Transaction accepted. Will confirm in block {block_idx}.")
-print("  Mining block 2...")
-chain.mine_pending_transactions(miner.address)
-print()
-balances(chain, Alice=alice, Bob=bob, Miner=miner)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            r = requests.get(f"{NODE}/", timeout=2)
+            if r.status_code == 200:
+                return True
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return False
 
 
-# ---------------------------------------------------------------------------
-# 5. Alice → Bob: 8 DRN (signed)
-# ---------------------------------------------------------------------------
-section("5. Alice sends Bob 8 DRN  (signed transaction)")
+def main():
+    banner("DorianCoin Stage 8 — CLI Wallet Demo")
+    print("""
+  This demo starts a live DorianCoin node then runs every
+  drn_wallet.py command against it automatically.
+    """)
 
-tx2 = alice.create_transaction(bob.address, 8)
-chain.add_transaction(tx2)
-print("\n  Mining block 3...")
-chain.mine_pending_transactions(miner.address)
-print()
-balances(chain, Alice=alice, Bob=bob, Miner=miner)
+    os.makedirs(KEYS_DIR, exist_ok=True)
+    for f in [ALICE_PEM, BOB_PEM]:
+        if os.path.exists(f):
+            os.remove(f)
 
+    step(1, f"Starting DorianCoin node on port {PORT}…")
+    proc = start_node()
+    print(f"  Node PID: {proc.pid}")
 
-# ---------------------------------------------------------------------------
-# 6. Bob → Alice: 3 DRN (signed)
-# ---------------------------------------------------------------------------
-section("6. Bob sends Alice 3 DRN  (signed transaction)")
+    step(2, "Waiting for node to be ready…")
+    if not wait_for_node():
+        print("  [ERROR] Node did not start in time.")
+        proc.terminate()
+        sys.exit(1)
+    print(f"  Node is ready at {NODE}")
 
-tx3 = bob.create_transaction(alice.address, 3)
-chain.add_transaction(tx3)
-print("\n  Mining block 4...")
-chain.mine_pending_transactions(miner.address)
-print()
-balances(chain, Alice=alice, Bob=bob, Miner=miner)
+    try:
+        step(3, "drn_wallet.py new  — generate Alice's wallet")
+        run_cmd("new", "--save", ALICE_PEM)
 
+        step(4, "drn_wallet.py address  — inspect key file")
+        run_cmd("address", ALICE_PEM)
 
-# ---------------------------------------------------------------------------
-# 7. Chain integrity
-# ---------------------------------------------------------------------------
-section("7. Chain Integrity Check")
+        alice = Wallet.load(ALICE_PEM)
 
-valid = chain.is_valid()
-print(f"\n  Blockchain valid: {valid}")
-assert valid, "Chain should be valid!"
-chain.print_chain()
+        bob = Wallet()
+        bob.save(BOB_PEM)
+        print(f"\n  Bob's address : {bob.address}")
+        print(f"  Bob's key file: {BOB_PEM}")
 
+        step(5, "drn_wallet.py info  — node statistics (before mining)")
+        run_cmd("info")
 
-# ---------------------------------------------------------------------------
-# 8. Forgery attempt — garbage signature
-# ---------------------------------------------------------------------------
-section("8. Attack: Forged Signature (garbage bytes)")
+        step(6, "drn_wallet.py mine  — mine block 1 (Alice earns 50 DRN)")
+        run_cmd("mine", "--miner", alice.address)
 
-print("\n  Attempting to submit a transaction with a fake signature...")
-fake_tx = {
-    "sender":     alice.address,
-    "recipient":  bob.address,
-    "amount":     9_999,
-    "public_key": alice.get_public_key_hex(),
-    "signature":  "deadbeefdeadbeef",   # complete garbage
-}
-try:
-    chain.add_transaction(fake_tx)
-    print("  ERROR: forged transaction was accepted!")
-    raise SystemExit(1)
-except ValueError as e:
-    print(f"  [BLOCKED] {e}")
+        step(7, "drn_wallet.py balance  — Alice's confirmed balance")
+        run_cmd("balance", alice.address)
 
+        step(8, "drn_wallet.py send  — Alice -> Bob 15 DRN")
+        run_cmd("send", "--key", ALICE_PEM, "--to", bob.address,
+                "--amount", "15", "-y")
 
-# ---------------------------------------------------------------------------
-# 9. Forgery attempt — valid sig but wrong sender address
-# ---------------------------------------------------------------------------
-section("9. Attack: Valid Sig, Wrong Sender Address")
+        step(9, "drn_wallet.py utxo  — full network balance snapshot")
+        run_cmd("utxo")
 
-print("\n  Attempting to claim Bob's address while signing with Alice's key...")
-# Alice signs a tx that pretends to come from Bob's address
-wrong_address_tx = {
-    "sender":     bob.address,           # lying about the sender
-    "recipient":  alice.address,
-    "amount":     500,
-    "public_key": alice.get_public_key_hex(),  # but signing with Alice's key
-    "signature":  alice._sign({
-        "sender":    bob.address,
-        "recipient": alice.address,
-        "amount":    500,
-    }),
-}
-try:
-    chain.add_transaction(wrong_address_tx)
-    print("  ERROR: spoofed-sender transaction was accepted!")
-    raise SystemExit(1)
-except ValueError as e:
-    print(f"  [BLOCKED] {e}")
+        step(10, "drn_wallet.py mine  — mine block 2 (confirms Alice->Bob tx)")
+        run_cmd("mine", "--miner", alice.address)
 
+        step(11, "drn_wallet.py history  — Alice's transaction history")
+        run_cmd("history", alice.address, "--limit", "10")
 
-# ---------------------------------------------------------------------------
-# 10. Save and reload a wallet
-# ---------------------------------------------------------------------------
-section("10. Wallet Persistence")
+        step(12, "drn_wallet.py blocks  — recent 5 blocks")
+        run_cmd("blocks", "--count", "5")
 
-wallet_path = os.path.join("data", "alice_wallet.pem")
-alice.save(wallet_path)
+        step(13, "drn_wallet.py balance  — Bob's balance after confirmation")
+        run_cmd("balance", bob.address)
 
-alice_reloaded = Wallet.load(wallet_path)
-assert alice_reloaded.address == alice.address, "Reloaded address mismatch!"
-print(f"  Reloaded address matches original: {alice_reloaded.address}")
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+        print(f"\n  Node (PID {proc.pid}) stopped.")
 
-# Make sure reloaded wallet can still sign valid transactions
-tx_reload = alice_reloaded.create_transaction(bob.address, 1)
-assert Wallet.verify_transaction(tx_reload), "Reloaded wallet signing failed!"
-print("  [OK] Reloaded wallet can sign valid transactions.")
+    banner("Stage 8 Complete!")
+    print("""
+  Commands demonstrated:
+    [OK] new       -- generate + save wallet keypair
+    [OK] address   -- inspect and display key file
+    [OK] info      -- live node + chain statistics
+    [OK] mine      -- trigger Proof-of-Work mining
+    [OK] balance   -- confirmed + available balance
+    [OK] send      -- sign + broadcast transaction
+    [OK] utxo      -- full network balance snapshot
+    [OK] history   -- paginated confirmed tx history
+    [OK] blocks    -- recent block list
+
+  Usage cheatsheet:
+    python doriancoin/drn_wallet.py new --save keys/me.pem
+    python doriancoin/drn_wallet.py send --key keys/me.pem --to DRN1... --amount 5
+    python doriancoin/drn_wallet.py balance DRN1...
+    python doriancoin/drn_wallet.py history DRN1...
+    python doriancoin/drn_wallet.py info
+    python doriancoin/drn_wallet.py utxo
+    """)
 
 
-# ---------------------------------------------------------------------------
-# Done
-# ---------------------------------------------------------------------------
-section("Stage 2 Complete!")
-
-print("""
-  What we built:
-    - secp256k1 ECDSA key pairs (same curve as Bitcoin)
-    - Deterministic DRN addresses via SHA-256 + Base58Check
-    - Transaction signing  (private key signs canonical JSON body)
-    - Signature verification  (public key + address cross-check)
-    - Blockchain rejects ALL unsigned / forged / spoofed transactions
-    - Wallet save / load  (PKCS8 PEM)
-
-  What's next  (Stage 3 — Flask REST Node):
-    - POST /transactions/new   =>  submit a signed tx
-    - GET  /mine               =>  trigger PoW and earn DRN
-    - GET  /chain              =>  inspect the full blockchain
-    - Two nodes talking to each other over HTTP
-""")
+if __name__ == "__main__":
+    main()
