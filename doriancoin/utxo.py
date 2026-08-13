@@ -87,9 +87,13 @@ class UTXOState:
         return max(0.0, self._balances.get(address, 0.0))
 
     def pending_outgoing(self, address: str, pending_txns: list) -> float:
-        """Sum of all outgoing amounts for `address` currently in the mempool."""
+        """Total DRN reserved by address in the mempool (amount + fee).
+
+        Stage 9A: the fee is also deducted from available balance because
+        it will leave the sender's account when the tx is mined.
+        """
         return sum(
-            float(tx.get("amount", 0))
+            float(tx.get("amount", 0)) + float(tx.get("fee", 0))
             for tx in pending_txns
             if tx.get("sender") == address
         )
@@ -183,22 +187,27 @@ class UTXOState:
         confirmed   = self.confirmed_balance(sender)
         pending_out = self.pending_outgoing(sender, pending_txns)
         available   = confirmed - pending_out
+        total_cost  = amount + float(tx.get("fee", 0))
 
-        if amount > available:
+        if total_cost > available:
+            fee = float(tx.get("fee", 0))
             if confirmed <= 0:
                 reason = (
-                    f"Address {sender[:20]}… has no confirmed balance. "
-                    f"You need at least {amount} DRN."
+                    f"Address {sender[:20]}... has no confirmed balance. "
+                    f"You need at least {total_cost} DRN "
+                    f"(amount={amount} + fee={fee})."
                 )
             elif pending_out > 0:
                 reason = (
-                    f"Double-spend detected: requested {amount:.4f} DRN but only "
-                    f"{available:.4f} DRN is available "
+                    f"Double-spend detected: total cost {total_cost:.4f} DRN "
+                    f"(amount={amount:.4f} + fee={fee:.4f}) exceeds "
+                    f"available {available:.4f} DRN "
                     f"(confirmed={confirmed:.4f}, pending_out={pending_out:.4f})."
                 )
             else:
                 reason = (
-                    f"Insufficient funds: requested {amount:.4f} DRN, "
+                    f"Insufficient funds: total cost {total_cost:.4f} DRN "
+                    f"(amount={amount:.4f} + fee={fee:.4f}), "
                     f"confirmed balance is {confirmed:.4f} DRN."
                 )
             return False, reason

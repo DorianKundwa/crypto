@@ -260,6 +260,12 @@ def cmd_send(args) -> int:
     kv("From",   cyan(w.address))
     kv("To",     cyan(args.to))
     kv("Amount", f"{bold(str(args.amount))} DRN")
+    fee_val  = float(getattr(args, "fee", 0.0) or 0.0)
+    lock_val = int(getattr(args, "lock_until_block", 0) or 0)
+    if fee_val:
+        kv("Fee",  f"{yellow(str(fee_val))} DRN  {dim('(miner tip)')}")
+    if lock_val:
+        kv("Locked until", f"block {cyan(str(lock_val))}")
     kv("Node",   dim(_NODE))
     blank()
 
@@ -277,7 +283,12 @@ def cmd_send(args) -> int:
     # Build + sign
     print(f"  {dim('Signing…')}", end="", flush=True)
     try:
-        tx = w.create_transaction(recipient=args.to, amount=float(args.amount))
+        tx = w.create_transaction(
+            recipient=args.to,
+            amount=float(args.amount),
+            fee=float(getattr(args, "fee", 0.0) or 0.0),
+            lock_until_block=int(getattr(args, "lock_until_block", 0) or 0),
+        )
     except Exception as e:
         print()
         err(f"Failed to sign: {e}")
@@ -589,6 +600,10 @@ Examples:
                     help="Recipient DRN address")
     sp.add_argument("--amount", required=True, type=float, metavar="DRN",
                     help="Amount to send (in DRN)")
+    sp.add_argument("--fee",    type=float, default=0.0, metavar="DRN",
+                    help="Miner tip in DRN (default 0 -- free tx, lower priority)")
+    sp.add_argument("--lock-until-block", type=int, default=0, metavar="N",
+                    help="Time-lock: tx stays pending until block N is mined")
     sp.add_argument("-y", "--yes", action="store_true",
                     help="Skip confirmation prompt")
 

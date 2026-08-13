@@ -1,29 +1,25 @@
 """
-wallet.py — DorianCoin (DRN) Cryptographic Wallet
-==================================================
-Stage 2: ECDSA key pairs on secp256k1 (same curve as Bitcoin),
-         Base58Check address derivation, transaction signing,
-         and static signature verification.
+wallet.py -- DorianCoin (DRN) Cryptographic Wallet
+===================================================
+Stage 2: ECDSA key pairs on secp256k1, Base58Check addresses,
+         transaction signing and static signature verification.
+Stage 9: fee field included in signed payload (tamper-proof);
+         2-of-2 multi-sig wallet support (MultiSigWallet).
 
 Key pipeline:
   Private Key (secp256k1)
        |
   Public Key  (uncompressed X9.62, 65 bytes)
        |
-  SHA-256(pub_bytes)[:20]        ← simplified hash160
+  SHA-256(pub_bytes)[:20]        <- simplified hash160
        |
-  version_byte + 20-byte hash    ← payload
+  version_byte + 20-byte hash    <- payload
        |
-  Base58Check encode             ← checksum included
+  Base58Check encode             <- checksum included
        |
-  "DRN" prefix                   ← human-readable marker
+  "DRN" prefix                   <- human-readable marker
        =
   DRN address  (e.g. DRN1A8Xxz...)
-
-Later stages will add:
-  - HD wallets / BIP-32 derivation paths
-  - Wallet persistence with AES-encrypted key files
-  - Multi-sig support
 """
 
 import hashlib
@@ -218,30 +214,54 @@ class Wallet:
     # Transaction creation & signing
     # ------------------------------------------------------------------
 
-    def create_transaction(self, recipient: str, amount: float) -> dict:
+    def create_transaction(self, recipient: str, amount: float,
+                            fee: float = 0.0,
+                            lock_until_block: int = 0) -> dict:
         """Build, sign, and return a transaction dict.
 
         The returned dict contains everything a node needs to:
-          • Display the transfer   (sender, recipient, amount)
-          • Verify authenticity    (public_key, signature)
+          * Display the transfer   (sender, recipient, amount, fee)
+          * Verify authenticity    (public_key, signature)
+          * Enforce time-lock      (lock_until_block, stage 9C)
+
+        The *fee* and *lock_until_block* are included in the signed
+        payload, making them tamper-proof: a miner or relay node cannot
+        strip the fee or change the lock height without invalidating the
+        signature.
+
+        Parameters
+        ----------
+        recipient        : Destination DRN address.
+        amount           : DRN to transfer (exclusive of fee).
+        fee              : Optional miner tip in DRN (default 0.0).
+        lock_until_block : If > 0, tx is unspendable until this block
+                           index is reached (stage 9C time-lock).
 
         Dict schema::
 
             {
-                "sender"    : "DRN1...",
-                "recipient" : "DRN1...",
-                "amount"    : 10.0,
-                "public_key": "04ab...",   # 130-hex uncompressed pub key
-                "signature" : "3045..."    # DER-encoded ECDSA sig, hex
+                "sender"           : "DRN1...",
+                "recipient"        : "DRN1...",
+                "amount"           : 10.0,
+                "fee"              : 0.5,
+                "lock_until_block" : 0,       # 0 = no lock
+                "public_key"       : "04ab...",
+                "signature"        : "3045..."
             }
         """
         if amount <= 0:
             raise ValueError(f"Transaction amount must be positive, got {amount}")
+        if fee < 0:
+            raise ValueError(f"Fee cannot be negative, got {fee}")
+        if lock_until_block < 0:
+            raise ValueError(f"lock_until_block cannot be negative")
 
         tx_body = {
-            "sender":    self.address,
-            "recipient": recipient,
-            "amount":    amount,
+            "sender":           self.address,
+            "recipient":        recipient,
+            "amount":           amount,
+            "fee":              fee,
+            "lock_until_block": lock_until_block,
         }
         signature = self._sign(tx_body)
 
@@ -274,11 +294,17 @@ class Wallet:
         Returns True  if the signature is cryptographically valid.
         Returns False if anything is missing, malformed, or tampered.
 
-        Coinbase / network reward transactions (sender == 'NETWORK') are
-        implicitly trusted and always return True.
+        Coinbase transactions (sender == 'NETWORK') are implicitly trusted.
+        Multi-sig transactions (sender starts with 'MSIG:') are dispatched
+        to verify_multisig_transaction() (Stage 9C).
         """
-        if tx.get("sender") == "NETWORK":
-            return True          # minted coins — no signature expected
+        sender = tx.get("sender", "")
+
+        if sender == "NETWORK":
+            return True          # minted coins -- no signature expected
+
+        if sender.startswith("MSIG:"):
+            return Wallet.verify_multisig_transaction(tx)
 
         required = {"sender", "recipient", "amount", "public_key", "signature"}
         if not required.issubset(tx):
@@ -293,19 +319,145 @@ class Wallet:
 
             # Re-derive the address from the public key and check it matches
             derived_address = pubkey_to_address(public_key)
-            if derived_address != tx["sender"]:
+            if derived_address != sender:
                 return False     # public_key doesn't match the claimed sender
 
-            # Reconstruct the exact bytes that were signed
-            tx_body  = {
-                "sender":    tx["sender"],
-                "recipient": tx["recipient"],
-                "amount":    tx["amount"],
+            # Reconstruct the exact bytes that were signed.
+            # Stage 9: fee and lock_until_block are part of the signed body
+            # so they cannot be altered after signing.
+            tx_body = {
+                "sender":           tx["sender"],
+                "recipient":        tx["recipient"],
+                "amount":           tx["amount"],
+                "fee":              tx.get("fee", 0.0),
+                "lock_until_block": tx.get("lock_until_block", 0),
             }
-            encoded  = json.dumps(tx_body, sort_keys=True).encode()
-            der_sig  = bytes.fromhex(tx["signature"])
+            encoded = json.dumps(tx_body, sort_keys=True).encode()
+            der_sig = bytes.fromhex(tx["signature"])
 
             public_key.verify(der_sig, encoded, ec.ECDSA(hashes.SHA256()))
+            return True
+
+        except (InvalidSignature, KeyError, ValueError, Exception):
+            return False
+
+    # ------------------------------------------------------------------
+    # Stage 9C -- Multi-Sig (2-of-2)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def make_multisig_address(pubkey_hex_a: str, pubkey_hex_b: str) -> str:
+        """Derive a deterministic 2-of-2 multi-sig address.
+
+        The address is derived from the SHA-256 of the two public keys
+        sorted lexicographically, so the order Alice/Bob supply them
+        doesn't matter -- both orderings produce the same address.
+
+        Returns a DRN address prefixed with 'MSIG:' so nodes can detect
+        the multi-sig path during verification.
+        """
+        sorted_keys = sorted([pubkey_hex_a, pubkey_hex_b])
+        payload     = json.dumps(sorted_keys, sort_keys=True).encode()
+        key_hash    = hashlib.sha256(payload).digest()[:20]
+        b58         = _b58check_encode(_VERSION_BYTE + key_hash)
+        return "MSIG:DRN" + b58
+
+    @staticmethod
+    def create_multisig_transaction(
+        wallet_a: "Wallet",
+        wallet_b: "Wallet",
+        recipient: str,
+        amount: float,
+        fee: float = 0.0,
+    ) -> dict:
+        """Create a 2-of-2 multi-sig transaction signed by both parties.
+
+        Both wallets must be available at transaction-creation time.
+        Both ECDSA signatures cover the same canonical body, so either
+        wallet can be wallet_a or wallet_b -- the MSIG address is derived
+        from sorted public keys and is commutative.
+
+        Parameters
+        ----------
+        wallet_a, wallet_b : The two co-signing wallets.
+        recipient          : Destination DRN address.
+        amount             : DRN to transfer.
+        fee                : Miner tip.
+        """
+        if amount <= 0:
+            raise ValueError("Amount must be positive")
+        if fee < 0:
+            raise ValueError("Fee cannot be negative")
+
+        msig_address = Wallet.make_multisig_address(
+            wallet_a.get_public_key_hex(),
+            wallet_b.get_public_key_hex(),
+        )
+
+        tx_body = {
+            "sender":           msig_address,
+            "recipient":        recipient,
+            "amount":           amount,
+            "fee":              fee,
+            "lock_until_block": 0,
+        }
+        encoded   = json.dumps(tx_body, sort_keys=True).encode()
+        sig_a     = wallet_a.private_key.sign(encoded, ec.ECDSA(hashes.SHA256())).hex()
+        sig_b     = wallet_b.private_key.sign(encoded, ec.ECDSA(hashes.SHA256())).hex()
+
+        return {
+            **tx_body,
+            "pubkey_a":   wallet_a.get_public_key_hex(),
+            "pubkey_b":   wallet_b.get_public_key_hex(),
+            "signature_a": sig_a,
+            "signature_b": sig_b,
+        }
+
+    @staticmethod
+    def verify_multisig_transaction(tx: dict) -> bool:
+        """Verify both ECDSA signatures of a 2-of-2 multi-sig transaction.
+
+        Rules:
+          1. sender must start with 'MSIG:'
+          2. Both pubkey_a and pubkey_b must be present
+          3. The MSIG address must match make_multisig_address(a, b)
+          4. Both signature_a and signature_b must be valid over tx_body
+        """
+        required = {"sender", "recipient", "amount",
+                    "pubkey_a", "pubkey_b", "signature_a", "signature_b"}
+        if not required.issubset(tx):
+            return False
+
+        try:
+            pubkey_hex_a = tx["pubkey_a"]
+            pubkey_hex_b = tx["pubkey_b"]
+
+            # Verify the MSIG address matches the two public keys
+            expected_addr = Wallet.make_multisig_address(pubkey_hex_a, pubkey_hex_b)
+            if tx["sender"] != expected_addr:
+                return False
+
+            # Reconstruct the canonical body both parties signed
+            tx_body = {
+                "sender":           tx["sender"],
+                "recipient":        tx["recipient"],
+                "amount":           tx["amount"],
+                "fee":              tx.get("fee", 0.0),
+                "lock_until_block": tx.get("lock_until_block", 0),
+            }
+            encoded = json.dumps(tx_body, sort_keys=True).encode()
+
+            for pubkey_hex, sig_hex in [
+                (pubkey_hex_a, tx["signature_a"]),
+                (pubkey_hex_b, tx["signature_b"]),
+            ]:
+                pub_bytes  = bytes.fromhex(pubkey_hex)
+                public_key = ec.EllipticCurvePublicKey.from_encoded_point(
+                    ec.SECP256K1(), pub_bytes
+                )
+                der_sig    = bytes.fromhex(sig_hex)
+                public_key.verify(der_sig, encoded, ec.ECDSA(hashes.SHA256()))
+
             return True
 
         except (InvalidSignature, KeyError, ValueError, Exception):

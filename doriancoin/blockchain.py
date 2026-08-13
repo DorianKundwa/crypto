@@ -8,10 +8,7 @@ Stage 4: Automatic difficulty retargeting every N blocks.
 Stage 5: Persistent SQLite storage -- chain survives node restarts.
 Stage 6: Block Explorer served from node.py GET /explorer.
 Stage 7: UTXO balance tracking + double-spend protection.
-
-Later stages will add:
-  - Mempool fee prioritisation
-  - CLI wallet tool
+Stage 9: Fee-based mempool prioritisation + timelock + multi-sig dispatch.
 """
 
 import hashlib
@@ -165,6 +162,7 @@ class Blockchain:
 
     # Block reward paid to the miner (like Bitcoin's coinbase tx).
     BLOCK_REWARD: int = 50
+    MAX_TXNS_PER_BLOCK = 10      # Stage 9A: cap on user txns per block
 
     def __init__(
         self,
@@ -337,34 +335,67 @@ class Blockchain:
     # ------------------------------------------------------------------
 
     def mine_pending_transactions(self, miner_address: str) -> Block:
-        """Bundle all pending transactions + a coinbase reward into a new
-        block, run Proof-of-Work, and append the block to the chain.
+        """Bundle pending transactions + coinbase reward into a new block.
+
+        Stage 9A — Fee prioritisation
+        ------------------------------
+        1. Filter out time-locked txns not yet mature (lock_until_block).
+        2. Sort remaining mempool by `fee` descending (highest fee first).
+        3. Take the top MAX_TXNS_PER_BLOCK user transactions.
+        4. Coinbase = BLOCK_REWARD + sum(fees of selected txns).
+
+        Time-locked txns remain in the mempool until their block arrives.
 
         Parameters
         ----------
-        miner_address : The DRN address that receives the block reward.
+        miner_address : The DRN address that receives the block reward + fees.
 
         Returns
         -------
         The newly mined and appended Block.
         """
-        # Coinbase / block-reward transaction (like Bitcoin's first tx)
+        next_index = len(self.chain)   # this will be the new block's index
+
+        # ── Stage 9C: filter time-locked transactions ─────────────────
+        ready, locked = [], []
+        for tx in self.pending_transactions:
+            lock = tx.get("lock_until_block", 0)
+            if lock and lock > next_index:
+                locked.append(tx)      # stays in mempool
+            else:
+                ready.append(tx)       # eligible to be mined
+
+        # ── Stage 9A: sort by fee desc, cap at MAX_TXNS_PER_BLOCK ─────
+        ready_sorted = sorted(
+            ready,
+            key=lambda t: float(t.get("fee", 0)),
+            reverse=True,
+        )
+        selected  = ready_sorted[:self.MAX_TXNS_PER_BLOCK]
+        leftover  = ready_sorted[self.MAX_TXNS_PER_BLOCK:]  # bumped to next block
+
+        # ── Fees → coinbase ───────────────────────────────────────────
+        total_fees  = sum(float(tx.get("fee", 0)) for tx in selected)
         coinbase_tx = {
-            "sender":    "NETWORK",          # freshly minted coins
+            "sender":    "NETWORK",
             "recipient": miner_address,
-            "amount":    self.BLOCK_REWARD,
+            "amount":    self.BLOCK_REWARD + total_fees,
         }
 
-        transactions = self.pending_transactions + [coinbase_tx]
+        transactions = selected + [coinbase_tx]
 
         block = Block(
-            index=len(self.chain),
+            index=next_index,
             transactions=transactions,
             previous_hash=self.get_latest_block().hash,
             difficulty=self.difficulty,
         )
 
-        print(f"  Mining block {block.index}...")
+        locked_count   = len(locked)
+        leftover_count = len(leftover)
+        print(f"  Mining block {block.index}...  "
+              f"({len(selected)} txns, {locked_count} locked, "
+              f"{leftover_count} bumped, fees={total_fees:.4f} DRN)")
         start = time.perf_counter()
         block.mine()
         elapsed = time.perf_counter() - start
@@ -372,10 +403,11 @@ class Blockchain:
         print(f"  [OK] Block {block.index} mined in {elapsed:.2f}s")
         print(f"    Hash  : {block.hash}")
         print(f"    Nonce : {block.nonce:,}")
-        print(f"    Txns  : {len(transactions)}")
+        print(f"    Txns  : {len(transactions)}  (reward={self.BLOCK_REWARD}+{total_fees:.4f} fees)")
 
         self.chain.append(block)
-        self.pending_transactions = []
+        # Preserve locked + bumped txns for the next block
+        self.pending_transactions = locked + leftover
 
         # Stage 4: attempt difficulty retarget
         retarget = self._adjust_difficulty()

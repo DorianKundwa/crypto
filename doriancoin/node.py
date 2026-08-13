@@ -98,18 +98,23 @@ def _push_tx_to_peers(tx: dict) -> None:
             pass
 
 
-def _pull_resolve_from_peers() -> bool:
+def _pull_resolve_from_peers() -> None:
     """Ask all peers to pull-resolve after we mine a block.
 
-    Each peer calls GET /nodes/resolve on itself, which triggers it to
-    pull our (now-longer) chain.  This is simpler than pushing blocks.
+    Runs in a background daemon thread (fire-and-forget) so the /mine
+    response is returned to the caller immediately, avoiding the deadlock
+    where A waits for B/C which try to call A's /chain while A is still
+    inside its own mine request handler.
     """
-    for addr in list(peer_nodes):
-        try:
-            requests.get(f"http://{addr}/nodes/resolve", timeout=5)
-        except requests.RequestException:
-            pass
-    return True
+    def _notify():
+        for addr in list(peer_nodes):
+            try:
+                requests.get(f"http://{addr}/nodes/resolve", timeout=8)
+            except requests.RequestException:
+                pass
+
+    t = threading.Thread(target=_notify, daemon=True)
+    t.start()
 
 
 def _run_consensus() -> bool:
@@ -211,42 +216,62 @@ def pending_transactions():
 def new_transaction():
     """Accept and buffer a signed transaction.
 
-    Expected JSON body::
+    Expected JSON body (regular tx)::
 
         {
-            "sender":     "DRN1...",
-            "recipient":  "DRN1...",
-            "amount":     10.0,
-            "public_key": "04ab...",
-            "signature":  "3045..."
+            "sender":           "DRN1...",
+            "recipient":        "DRN1...",
+            "amount":           10.0,
+            "fee":              0.5,        # optional, default 0
+            "lock_until_block": 0,          # optional, 0 = no lock
+            "public_key":       "04ab...",
+            "signature":        "3045..."
         }
+
+    For multi-sig (sender starts with 'MSIG:'), replace public_key/signature
+    with pubkey_a, pubkey_b, signature_a, signature_b.
 
     Stage 2: Verifies the ECDSA signature before accepting.
     Stage 7: Verifies sender has sufficient funds (confirmed minus
              any already-pending outgoing) and rejects double-spends.
+    Stage 9: Accepts fee + lock_until_block; fee deducted from available
+             balance; miners prioritise high-fee transactions.
     """
     tx = request.get_json(silent=True)
     if not tx:
         return jsonify({"error": "No valid JSON body provided."}), 400
 
-    required = {"sender", "recipient", "amount", "public_key", "signature"}
-    missing  = required - set(tx.keys())
+    sender = tx.get("sender", "")
+
+    # Determine required fields based on tx type (regular vs multi-sig)
+    if sender.startswith("MSIG:"):
+        required = {"sender", "recipient", "amount",
+                    "pubkey_a", "pubkey_b", "signature_a", "signature_b"}
+    else:
+        required = {"sender", "recipient", "amount", "public_key", "signature"}
+
+    missing = required - set(tx.keys())
     if missing:
         return jsonify({"error": f"Missing required fields: {sorted(missing)}"}), 400
+
+    # Coerce optional fields to correct types
+    try:
+        tx["amount"] = float(tx["amount"])
+        tx["fee"]    = float(tx.get("fee", 0.0))
+        tx["lock_until_block"] = int(tx.get("lock_until_block", 0))
+    except (ValueError, TypeError) as e:
+        return jsonify({"error": f"Invalid field value: {e}"}), 400
 
     try:
         confirming_block = blockchain.add_transaction(tx)
     except ValueError as exc:
-        # Stage 7: enrich the rejection with current balance info
-        sender = tx.get("sender", "")
-        confirmed_bal  = blockchain.get_balance(sender) if sender else None
+        sender_bal = blockchain.get_balance(sender) if sender else None
         return jsonify({
             "error":             str(exc),
-            "sender_balance":    confirmed_bal,
+            "sender_balance":    sender_bal,
             "pending_in_mempool": len(blockchain.pending_transactions),
         }), 400
 
-    # Broadcast to peers only if this came from a client (not a peer relay)
     if not tx.get("_relayed"):
         tx["_relayed"] = True
         _push_tx_to_peers(tx)
@@ -257,6 +282,8 @@ def new_transaction():
         "sender":           tx["sender"],
         "recipient":        tx["recipient"],
         "amount":           tx["amount"],
+        "fee":              tx["fee"],
+        "lock_until_block": tx["lock_until_block"],
         "mempool_size":     len(blockchain.pending_transactions),
     }), 201
 
