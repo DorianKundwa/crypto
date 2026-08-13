@@ -16,8 +16,8 @@ venv/
 env/
 .env/
 
-# Node / miner keys (contain private keys — NEVER commit)
-doriancoin/data/
+# Node / miner keys + chain databases (contain private data — NEVER commit)
+data/
 
 # IDE / OS
 .vscode/
