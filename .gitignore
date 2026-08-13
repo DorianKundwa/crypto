@@ -35,3 +35,10 @@ htmlcov/
 
 # Flask / Werkzeug
 instance/
+
+# PyInstaller build artefacts
+build/
+dist/
+*.pyc
+__pycache__/
+*.spec.bak
