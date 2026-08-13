@@ -9,6 +9,8 @@ Stage 5: Persistent SQLite storage -- chain survives node restarts.
 Stage 6: Block Explorer served from node.py GET /explorer.
 Stage 7: UTXO balance tracking + double-spend protection.
 Stage 9: Fee-based mempool prioritisation + timelock + multi-sig dispatch.
+Stage 10: Merkle tree -- every block commits to a Merkle root of its
+          transactions; SPV proofs allow verifying a tx without the full block.
 """
 
 import hashlib
@@ -35,6 +37,123 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
+# Merkle tree  (Stage 10)
+# ---------------------------------------------------------------------------
+
+def _tx_hash(tx: dict) -> str:
+    """Canonical SHA-256 hash of a transaction dict (leaf hash)."""
+    return hashlib.sha256(
+        json.dumps(tx, sort_keys=True).encode()
+    ).hexdigest()
+
+
+def _pair_hash(left: str, right: str) -> str:
+    """Hash two sibling nodes together."""
+    return hashlib.sha256((left + right).encode()).hexdigest()
+
+
+def compute_merkle_root(transactions: list) -> str:
+    """Compute the Merkle root of a list of transaction dicts.
+
+    Algorithm
+    ---------
+    1. Hash each transaction to produce the leaf level.
+    2. Pair adjacent hashes, hashing each pair → next level.
+    3. If a level has an odd count, duplicate the last hash (Bitcoin rule).
+    4. Repeat until only one hash remains — the Merkle root.
+
+    An empty transaction list returns the SHA-256 of an empty byte string.
+    """
+    if not transactions:
+        return hashlib.sha256(b"").hexdigest()
+
+    level = [_tx_hash(tx) for tx in transactions]
+
+    while len(level) > 1:
+        if len(level) % 2 == 1:
+            level.append(level[-1])          # duplicate last (Bitcoin rule)
+        level = [
+            _pair_hash(level[i], level[i + 1])
+            for i in range(0, len(level), 2)
+        ]
+
+    return level[0]
+
+
+def compute_merkle_proof(transactions: list, tx_index: int) -> list:
+    """Build an inclusion proof for the transaction at `tx_index`.
+
+    Returns
+    -------
+    A list of (sibling_hash, 'left' | 'right') tuples.  An empty list
+    means the block contains exactly one transaction (the root IS the leaf).
+
+    Verification
+    ------------
+    Feed the proof into :func:`verify_merkle_proof` along with the tx
+    and the known Merkle root — no need to download the full block.
+    """
+    if not transactions:
+        raise ValueError("Cannot build proof for empty transaction list.")
+    if tx_index < 0 or tx_index >= len(transactions):
+        raise IndexError(
+            f"tx_index {tx_index} out of range (0..{len(transactions)-1})"
+        )
+
+    level = [_tx_hash(tx) for tx in transactions]
+    proof = []
+    idx   = tx_index
+
+    while len(level) > 1:
+        if len(level) % 2 == 1:
+            level.append(level[-1])          # mirror Bitcoin padding
+
+        if idx % 2 == 0:                     # we are the LEFT node
+            sibling = level[idx + 1]
+            proof.append((sibling, "right"))
+        else:                                # we are the RIGHT node
+            sibling = level[idx - 1]
+            proof.append((sibling, "left"))
+
+        # Build next level and move up
+        level = [
+            _pair_hash(level[i], level[i + 1])
+            for i in range(0, len(level), 2)
+        ]
+        idx //= 2
+
+    return proof
+
+
+def verify_merkle_proof(tx: dict, proof: list, root: str) -> bool:
+    """Verify that `tx` is included in a block whose Merkle root is `root`.
+
+    This is the SPV (Simplified Payment Verification) check: a lightweight
+    client can confirm a payment without downloading the full block — only
+    the tx itself and its proof path (O(log n) hashes) are needed.
+
+    Parameters
+    ----------
+    tx    : The transaction dict to verify.
+    proof : Path returned by :func:`compute_merkle_proof`.
+    root  : The block's known Merkle root (from its header).
+
+    Returns
+    -------
+    True if the proof is valid, False otherwise.
+    """
+    current = _tx_hash(tx)
+
+    for sibling, position in proof:
+        if position == "right":
+            current = _pair_hash(current, sibling)
+        else:
+            current = _pair_hash(sibling, current)
+
+    return current == root
+
+
+# ---------------------------------------------------------------------------
 # Block
 # ---------------------------------------------------------------------------
 
@@ -46,21 +165,24 @@ class Block:
     index           : Position in the chain (0 = genesis).
     timestamp       : UNIX time the block object was created.
     transactions    : List of transaction dicts included in this block.
+    merkle_root     : Stage 10 -- Merkle root of all transaction hashes.
     previous_hash   : Hash of the preceding block (links the chain).
     nonce           : Counter incremented during Proof-of-Work mining.
     difficulty      : Number of leading zeros required in the block hash.
-    hash            : Final SHA-256 hash — set after mine() completes.
+    hash            : Final SHA-256 hash -- set after mine() completes.
     """
 
     def __init__(self, index: int, transactions: list,
                  previous_hash: str, difficulty: int = 4):
-        self.index = index
-        self.timestamp = time.time()
+        self.index        = index
+        self.timestamp    = time.time()
         self.transactions = transactions
         self.previous_hash = previous_hash
-        self.nonce = 0
-        self.difficulty = difficulty
+        self.nonce        = 0
+        self.difficulty   = difficulty
         self.hash: str | None = None
+        # Stage 10: commit to Merkle root at construction time
+        self.merkle_root: str = compute_merkle_root(transactions)
 
     # ------------------------------------------------------------------
     # Hashing
@@ -78,10 +200,12 @@ class Block:
         block_data = {
             "index":         self.index,
             "timestamp":     self.timestamp,
-            "transactions":  self.transactions,
+            "merkle_root":   self.merkle_root,   # Stage 10: commits to tx set
             "previous_hash": self.previous_hash,
             "nonce":         self.nonce,
         }
+        # Transactions are represented by the Merkle root -- changing any
+        # single byte in any transaction invalidates the block hash.
         encoded = json.dumps(block_data, sort_keys=True).encode()
         return hashlib.sha256(encoded).hexdigest()
 
@@ -114,6 +238,7 @@ class Block:
             "index":         self.index,
             "timestamp":     self.timestamp,
             "transactions":  self.transactions,
+            "merkle_root":   self.merkle_root,
             "previous_hash": self.previous_hash,
             "nonce":         self.nonce,
             "difficulty":    self.difficulty,
@@ -134,9 +259,14 @@ class Block:
             previous_hash=data["previous_hash"],
             difficulty=data["difficulty"],
         )
-        block.timestamp = data["timestamp"]
-        block.nonce     = data["nonce"]
-        block.hash      = data["hash"]
+        block.timestamp   = data["timestamp"]
+        block.nonce       = data["nonce"]
+        block.hash        = data["hash"]
+        # Stage 10: restore merkle_root; recompute if missing (legacy blocks)
+        block.merkle_root = data.get(
+            "merkle_root",
+            compute_merkle_root(data["transactions"]),
+        )
         return block
 
 
@@ -521,8 +651,9 @@ class Blockchain:
         Checks (per block, starting at index 1):
           1. The stored hash matches a fresh recalculation.
           2. The previous_hash pointer links correctly to the prior block.
-          3. The hash satisfies the declared difficulty (starts with
-             the right number of leading zeros).
+          3. The hash satisfies the declared difficulty (leading zeros).
+          4. Stage 10 -- The merkle_root matches a fresh recomputation
+             from the stored transactions.
 
         The genesis block (index 0) is implicitly trusted.
         """
@@ -530,19 +661,26 @@ class Blockchain:
             current  = self.chain[i]
             previous = self.chain[i - 1]
 
-            # 1 — hash integrity
+            # 1 -- hash integrity
             if current.hash != current.calculate_hash():
                 print(f"  [!!] Block {i}: hash mismatch (tampered data?)")
                 return False
 
-            # 2 — chain linkage
+            # 2 -- chain linkage
             if current.previous_hash != previous.hash:
                 print(f"  [!!] Block {i}: broken chain link")
                 return False
 
-            # 3 — proof-of-work
+            # 3 -- proof-of-work
             if not current.hash.startswith("0" * current.difficulty):
                 print(f"  [!!] Block {i}: fails proof-of-work check")
+                return False
+
+            # 4 -- Stage 10: Merkle root integrity
+            expected_root = compute_merkle_root(current.transactions)
+            if current.merkle_root != expected_root:
+                print(f"  [!!] Block {i}: Merkle root mismatch "
+                      f"(transaction set may be tampered)")
                 return False
 
         return True
@@ -574,16 +712,20 @@ class Blockchain:
             # Reconstruct a transient Block object to recompute its hash
             current = Block.from_dict(current_data)
 
-            # 1 — hash integrity
+            # 1 -- hash integrity
             if current.hash != current.calculate_hash():
                 return False
 
-            # 2 — chain linkage
+            # 2 -- chain linkage
             if current.previous_hash != previous_data["hash"]:
                 return False
 
-            # 3 — proof-of-work
+            # 3 -- proof-of-work
             if not current.hash.startswith("0" * current.difficulty):
+                return False
+
+            # 4 -- Stage 10: Merkle root integrity
+            if current.merkle_root != compute_merkle_root(current.transactions):
                 return False
 
         return True
@@ -605,6 +747,66 @@ class Blockchain:
         if self.storage:
             self.storage.save_chain(self.chain)
             self._save_meta_to_storage()
+
+    # ------------------------------------------------------------------
+    # Stage 10: Merkle proof helpers
+    # ------------------------------------------------------------------
+
+    def get_merkle_proof(self, block_index: int, tx_index: int) -> dict:
+        """Return an SPV Merkle proof for a transaction in a block.
+
+        Parameters
+        ----------
+        block_index : Index of the block containing the transaction.
+        tx_index    : Position of the transaction within that block.
+
+        Returns
+        -------
+        dict with keys:
+          block_index, tx_index, tx, merkle_root, proof
+          where proof is a list of [sibling_hash, 'left'|'right'] pairs.
+
+        Raises
+        ------
+        IndexError   if block_index or tx_index is out of range.
+        """
+        if block_index < 0 or block_index >= len(self.chain):
+            raise IndexError(f"block_index {block_index} out of range.")
+        block = self.chain[block_index]
+        if tx_index < 0 or tx_index >= len(block.transactions):
+            raise IndexError(
+                f"tx_index {tx_index} out of range "
+                f"(block {block_index} has {len(block.transactions)} txns)."
+            )
+        proof = compute_merkle_proof(block.transactions, tx_index)
+        return {
+            "block_index": block_index,
+            "tx_index":    tx_index,
+            "tx":          block.transactions[tx_index],
+            "merkle_root": block.merkle_root,
+            "proof":       proof,
+        }
+
+    def verify_tx_in_block(self, tx: dict, block_index: int) -> bool:
+        """SPV check: verify tx is in the block using only the Merkle root.
+
+        Searches for tx by its hash among the block's transactions, builds
+        the proof, and verifies it against the stored Merkle root.
+        Returns False if the tx is not found or the proof fails.
+        """
+        if block_index < 0 or block_index >= len(self.chain):
+            return False
+        block  = self.chain[block_index]
+        tx_h   = _tx_hash(tx)
+        try:
+            idx = next(
+                i for i, t in enumerate(block.transactions)
+                if _tx_hash(t) == tx_h
+            )
+        except StopIteration:
+            return False
+        proof = compute_merkle_proof(block.transactions, idx)
+        return verify_merkle_proof(tx, proof, block.merkle_root)
 
     # ------------------------------------------------------------------
     # Balance

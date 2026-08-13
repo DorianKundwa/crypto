@@ -47,7 +47,8 @@ class BlockchainStorage:
         previous_hash TEXT    NOT NULL,
         nonce         INTEGER NOT NULL,
         difficulty    INTEGER NOT NULL,
-        hash          TEXT    NOT NULL UNIQUE
+        hash          TEXT    NOT NULL UNIQUE,
+        merkle_root   TEXT    NOT NULL DEFAULT ''
     );
 
     CREATE TABLE IF NOT EXISTS transactions (
@@ -100,6 +101,15 @@ class BlockchainStorage:
 
     def _init_schema(self) -> None:
         self._conn().executescript(self.SCHEMA)
+        # Stage 10: safe migration -- add merkle_root column if it was absent
+        # in an existing database created before Stage 10.
+        try:
+            self._conn().execute(
+                "ALTER TABLE blocks ADD COLUMN merkle_root TEXT NOT NULL DEFAULT ''"
+            )
+            self._conn().commit()
+        except Exception:
+            pass   # column already exists -- that's fine
         self._conn().commit()
 
     # ------------------------------------------------------------------
@@ -119,10 +129,12 @@ class BlockchainStorage:
         with conn:
             conn.execute(
                 """INSERT OR IGNORE INTO blocks
-                       (block_index, timestamp, previous_hash, nonce, difficulty, hash)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
+                       (block_index, timestamp, previous_hash, nonce,
+                        difficulty, hash, merkle_root)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (block.index, block.timestamp, block.previous_hash,
-                 block.nonce, block.difficulty, block.hash),
+                 block.nonce, block.difficulty, block.hash,
+                 getattr(block, "merkle_root", "")),
             )
             for tx in block.transactions:
                 conn.execute(
@@ -175,6 +187,9 @@ class BlockchainStorage:
                 (b["index"],),
             ).fetchall()
             b["transactions"] = [json.loads(r[0]) for r in tx_rows]
+            # Stage 10: ensure merkle_root key is present (empty string for
+            # legacy rows; Block.from_dict() will recompute if needed)
+            b.setdefault("merkle_root", "")
 
             chain.append(b)
         return chain

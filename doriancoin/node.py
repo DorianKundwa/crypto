@@ -417,6 +417,70 @@ def explorer():
     return send_file(os.path.join(here, "explorer.html"))
 
 
+@app.route("/block/<int:block_index>/proof/<int:tx_index>", methods=["GET"])
+def merkle_proof(block_index, tx_index):
+    """Return a Merkle inclusion proof for a transaction.
+
+    Stage 10 -- SPV (Simplified Payment Verification)
+    --------------------------------------------------
+    Allows a lightweight client to verify a payment was included in a block
+    without downloading the full chain.  Only O(log n) sibling hashes are
+    needed.
+
+    Response JSON::
+
+        {
+            "block_index": 3,
+            "tx_index":    1,
+            "tx":          { ... },
+            "merkle_root": "ab12...",
+            "proof": [
+                ["cd34...", "right"],
+                ["ef56...", "left"]
+            ],
+            "verified": true
+        }
+    """
+    try:
+        result = blockchain.get_merkle_proof(block_index, tx_index)
+    except (IndexError, ValueError) as e:
+        return jsonify({"error": str(e)}), 404
+
+    from blockchain import verify_merkle_proof
+    verified = verify_merkle_proof(
+        result["tx"], result["proof"], result["merkle_root"]
+    )
+    return jsonify({
+        "block_index": result["block_index"],
+        "tx_index":    result["tx_index"],
+        "tx":          result["tx"],
+        "merkle_root": result["merkle_root"],
+        "proof":       result["proof"],
+        "proof_depth": len(result["proof"]),
+        "verified":    verified,
+    }), 200
+
+
+@app.route("/block/<int:block_index>/verify/<int:tx_index>", methods=["GET"])
+def verify_merkle(block_index, tx_index):
+    """Quick SPV check -- returns {verified: true/false} for a tx in a block."""
+    try:
+        result = blockchain.get_merkle_proof(block_index, tx_index)
+    except (IndexError, ValueError) as e:
+        return jsonify({"error": str(e)}), 404
+
+    from blockchain import verify_merkle_proof
+    verified = verify_merkle_proof(
+        result["tx"], result["proof"], result["merkle_root"]
+    )
+    return jsonify({
+        "block_index": block_index,
+        "tx_index":    tx_index,
+        "merkle_root": result["merkle_root"],
+        "verified":    verified,
+    }), 200
+
+
 @app.route("/wallet/new", methods=["GET"])
 def new_wallet():
     """Generate a fresh ECDSA wallet.
