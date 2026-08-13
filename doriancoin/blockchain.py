@@ -5,21 +5,29 @@ Stage 1: Block structure, SHA-256 hashing, Proof-of-Work, chain validation.
 Stage 2: ECDSA signature verification on every incoming transaction.
 Stage 3: Peer chain validation + load from JSON (for REST node consensus).
 Stage 4: Automatic difficulty retargeting every N blocks.
+Stage 5: Persistent SQLite storage -- chain survives node restarts.
 
 Later stages will add:
   - UTXO model / double-spend protection
-  - Persistent storage (SQLite)
   - Mempool fee prioritisation
+  - Block Explorer UI
 """
 
 import hashlib
 import json
 import time
+from typing import Optional
 
 # Wallet is imported lazily inside add_transaction to avoid any potential
 # circular-import issues when node.py later imports both modules.
 # (wallet.py never imports blockchain.py, so a top-level import is also safe.)
 from wallet import Wallet
+
+# BlockchainStorage is optional — only imported when a DB path is supplied.
+try:
+    from storage import BlockchainStorage
+except ImportError:
+    BlockchainStorage = None   # type: ignore
 
 
 # ---------------------------------------------------------------------------
@@ -158,8 +166,9 @@ class Blockchain:
         target_block_time: float = 10.0,
         min_difficulty:    int   = 1,
         max_difficulty:    int   = 8,
+        storage                  = None,   # Optional[BlockchainStorage]
     ):
-        """Create a new blockchain.
+        """Create a new blockchain, optionally backed by persistent storage.
 
         Parameters
         ----------
@@ -168,16 +177,62 @@ class Blockchain:
         target_block_time   Desired seconds per block   (Bitcoin: 600).
         min_difficulty      Floor for automatic retargeting.
         max_difficulty      Ceiling for automatic retargeting.
+        storage             Optional BlockchainStorage instance.  When
+                            provided the chain is loaded from (or saved to)
+                            the SQLite database on every mine.
         """
         self.difficulty         = difficulty
         self.retarget_interval  = retarget_interval
         self.target_block_time  = target_block_time
         self.min_difficulty     = min_difficulty
         self.max_difficulty     = max_difficulty
+        self.storage            = storage
 
-        self.chain: list                = [self._create_genesis_block()]
         self.pending_transactions: list = []
         self.retarget_log: list         = []   # history of every retarget event
+
+        # ----------------------------------------------------------
+        # Stage 5: restore from DB if we have a saved chain
+        # ----------------------------------------------------------
+        if storage and storage.has_chain():
+            print("[Storage] Loading chain from database...")
+            self.chain = self._load_from_storage()
+
+            # Restore difficulty + retarget settings that were saved last
+            saved_diff = storage.load_meta("difficulty", difficulty)
+            saved_ri   = storage.load_meta("retarget_interval", retarget_interval)
+            saved_tbt  = storage.load_meta("target_block_time", target_block_time)
+            self.difficulty        = saved_diff
+            self.retarget_interval = saved_ri
+            self.target_block_time = saved_tbt
+
+            print(f"[Storage] Restored {len(self.chain)} block(s)  "
+                  f"difficulty={self.difficulty}")
+        else:
+            # Fresh start -- mine genesis and immediately persist it
+            genesis     = self._create_genesis_block()
+            self.chain  = [genesis]
+            if storage:
+                storage.save_block(genesis)
+                self._save_meta_to_storage()
+                print(f"[Storage] Genesis saved to {storage.db_path}")
+
+    def _load_from_storage(self) -> list:
+        """Reconstruct Block objects from the SQLite database."""
+        from blockchain import Block   # local import avoids circular ref risk
+        chain_data = self.storage.load_chain()
+        return [Block.from_dict(bd) for bd in chain_data]
+
+    def _save_meta_to_storage(self) -> None:
+        """Persist current difficulty and retarget config to node_meta."""
+        if not self.storage:
+            return
+        self.storage.save_meta("difficulty",        self.difficulty)
+        self.storage.save_meta("retarget_interval", self.retarget_interval)
+        self.storage.save_meta("target_block_time", self.target_block_time)
+        self.storage.save_meta("min_difficulty",    self.min_difficulty)
+        self.storage.save_meta("max_difficulty",    self.max_difficulty)
+
 
     # ------------------------------------------------------------------
     # Genesis
@@ -301,6 +356,11 @@ class Blockchain:
             print(f"    actual={retarget['actual_time']:.2f}s  "
                   f"target={retarget['target_time']:.2f}s  "
                   f"ratio={retarget['ratio']:.3f}x")
+
+        # Stage 5: persist the new block (and updated difficulty) to SQLite
+        if self.storage:
+            self.storage.save_block(block)
+            self._save_meta_to_storage()
 
         return block
 
@@ -471,21 +531,33 @@ class Blockchain:
 
         Called by the /nodes/resolve endpoint when a longer valid chain
         is found among peers.  Pending transactions are intentionally
-        preserved — they haven't been confirmed yet.
+        preserved -- they haven't been confirmed yet.
+
+        Stage 5: also persists the replaced chain to SQLite so the node
+        survives a restart with the correct (consensus) chain.
         """
         self.chain = [Block.from_dict(b) for b in chain_data]
+
+        # Persist the replaced chain so the node survives a restart
+        if self.storage:
+            self.storage.save_chain(self.chain)
+            self._save_meta_to_storage()
 
     # ------------------------------------------------------------------
     # Balance
     # ------------------------------------------------------------------
 
     def get_balance(self, address: str) -> float:
-        """Walk every confirmed transaction in the chain and return the
-        net DRN balance for `address`.
+        """Return the net DRN balance for `address`.
 
-        This is a naive full-scan approach.  Stage 4 will replace it
-        with a proper UTXO set for O(1) lookups.
+        Stage 5 fast path: if a storage backend is attached, delegates
+        to a SQL SUM query which is O(log n) via index instead of O(n).
+        Falls back to a full chain scan when no storage is configured.
         """
+        if self.storage:
+            return self.storage.get_balance(address)
+
+        # Fallback: walk every transaction in every block
         balance = 0.0
         for block in self.chain:
             for tx in block.transactions:

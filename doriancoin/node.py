@@ -47,6 +47,7 @@ from flask import Flask, jsonify, request
 
 from blockchain import Blockchain, Block
 from wallet import Wallet
+from storage import BlockchainStorage
 
 # ---------------------------------------------------------------------------
 # Flask app
@@ -62,6 +63,7 @@ app.config["JSON_SORT_KEYS"] = False   # preserve insertion order in responses
 NODE_ID: str              = str(uuid.uuid4()).replace("-", "")[:12]
 blockchain: Blockchain    = None   # type: ignore  # set after Flask starts
 miner_wallet: Wallet      = None   # type: ignore  # set after Flask starts
+node_storage              = None   # type: ignore  # BlockchainStorage, set after Flask starts
 peer_nodes: set           = set()  # "host:port" strings (no http://)
 _node_ready: bool         = False  # True once genesis block is mined
 
@@ -146,7 +148,7 @@ def index():
     """
     if not _node_ready:
         return jsonify({"status": "initialising", "node_id": NODE_ID}), 503
-    return jsonify({
+    resp = {
         "node_id":          NODE_ID,
         "miner_address":    miner_wallet.address,
         "chain_height":     blockchain.height,
@@ -155,7 +157,10 @@ def index():
         "peers":            list(peer_nodes),
         "chain_valid":      blockchain.is_valid(),
         "retarget_status":  blockchain.retarget_status(),
-    })
+    }
+    if node_storage:
+        resp["storage"] = node_storage.stats()
+    return jsonify(resp)
 
 
 # ---------------------------------------------------------------------------
@@ -293,9 +298,33 @@ def get_difficulty():
     """
     return jsonify(blockchain.retarget_status())
 
-# ---------------------------------------------------------------------------
-# Routes — Wallet
-# ---------------------------------------------------------------------------
+
+@app.route("/storage", methods=["GET"])
+def get_storage():
+    """Return SQLite storage statistics for this node."""
+    if not node_storage:
+        return jsonify({"message": "No persistent storage configured."}), 404
+    return jsonify(node_storage.stats())
+
+
+@app.route("/history/<address>", methods=["GET"])
+def get_history(address: str):
+    """Return the last 50 confirmed transactions for an address.
+
+    Uses the indexed SQL query in BlockchainStorage for O(log n) speed.
+    Falls back to scanning the in-memory chain when no storage is attached.
+    """
+    if node_storage:
+        history = node_storage.get_address_history(address, limit=50)
+    else:
+        history = [
+            dict(tx, block_index=b.index, block_time=b.timestamp)
+            for b in blockchain.chain
+            for tx in b.transactions
+            if tx.get("sender") == address or tx.get("recipient") == address
+        ][-50:]
+    return jsonify({"address": address, "count": len(history), "transactions": history})
+
 
 @app.route("/wallet/new", methods=["GET"])
 def new_wallet():
@@ -410,24 +439,41 @@ if __name__ == "__main__":
     _init_target_block_time = args.target_block_time
 
     def _init_node() -> None:
-        global blockchain, miner_wallet, _node_ready
+        global blockchain, miner_wallet, node_storage, _node_ready
+
+        os.makedirs("data", exist_ok=True)
+
+        # Stage 5: open (or create) the node's SQLite database
+        db_path      = os.path.join("data", f"chain_{_init_port}.db")
+        node_storage = BlockchainStorage(db_path)
+
         blockchain = Blockchain(
             difficulty        = _init_difficulty,
             retarget_interval = _init_retarget_interval,
             target_block_time = _init_target_block_time,
+            storage           = node_storage,
         )
-        miner_wallet = Wallet()
 
-        os.makedirs("data", exist_ok=True)
+        # Load or generate the miner wallet
         miner_key_path = os.path.join("data", f"miner_{_init_port}.pem")
-        miner_wallet.save(miner_key_path)
+        if os.path.exists(miner_key_path):
+            miner_wallet = Wallet.load(miner_key_path)
+            print(f"[Wallet] Loaded miner wallet from {miner_key_path}")
+        else:
+            miner_wallet = Wallet()
+            miner_wallet.save(miner_key_path)
+            print(f"[Wallet] New miner wallet saved to {miner_key_path}")
 
+        stats = node_storage.stats()
         print()
         print("=" * 58)
         print(f"  DorianCoin Node  [{NODE_ID}]  READY")
         print("=" * 58)
         print(f"  Miner address : {miner_wallet.address}")
         print(f"  Chain height  : {blockchain.height}")
+        print(f"  Difficulty    : {blockchain.difficulty}")
+        print(f"  DB            : {stats['db_path']}  ({stats['db_size_kb']} KB)")
+        print(f"  Blocks in DB  : {stats['blocks_stored']}")
         print()
         _node_ready = True
 
@@ -449,8 +495,11 @@ if __name__ == "__main__":
     print(f"    GET  http://localhost:{args.port}/")
     print(f"    GET  http://localhost:{args.port}/chain")
     print(f"    GET  http://localhost:{args.port}/mine")
+    print(f"    GET  http://localhost:{args.port}/difficulty")
+    print(f"    GET  http://localhost:{args.port}/storage")
     print(f"    POST http://localhost:{args.port}/transactions/new")
     print(f"    GET  http://localhost:{args.port}/balance/<address>")
+    print(f"    GET  http://localhost:{args.port}/history/<address>")
     print(f"    POST http://localhost:{args.port}/nodes/register")
     print(f"    GET  http://localhost:{args.port}/nodes/resolve")
     print()
